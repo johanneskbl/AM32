@@ -285,13 +285,41 @@ uint32_t MINIMUM_RPM_SPEED_CONTROL = 1000;
 uint32_t MAXIMUM_RPM_SPEED_CONTROL = 13300;
 
 // assign speed control PID values values are x10000
+// With SPEED_PID_GAIN_SCHEDULING enabled Kp and Kd below are only the values
+// used before the first scheduled update; the schedule overwrites them.
 fastPID speedPid = { // commutation speed loop time
-    .Kp = 10,
+    .Kp = 80,  // 10
     .Ki = 0,
-    .Kd = 100,
+    .Kd = 100,  // 100
     .integral_limit = 10000,
     .output_limit = 50000
 };
+
+// Speed loop gain scheduling.
+//
+// The speed loop is driven from the commutation period error
+// (e_com_time - target_e_com_time), and e_com_time is inversely proportional
+// to rpm. A given rpm error therefore reaches the PID as a commutation time
+// error that scales with 1/rpm^2, so one fixed gain pair is about 180x hotter
+// at 1000 rpm than at 13300 rpm. Measured on a TMOTOR F55A: gains that track
+// cleanly above 8000 rpm limit-cycle below 2000 rpm, and gains that are stable
+// down there need seconds to settle at the top of the range.
+//
+// Scaling Kp and Kd with rpm^2, equivalently with 1/e_com_time^2, holds the
+// effective rpm domain loop gain constant over the whole range. The reference
+// pair is the gain applied at SPEED_PID_REF_RPM and every other speed is scaled
+// from it. Both terms take the same factor, so the Kd/Kp balance is unchanged.
+//
+// Note the loop accumulates its output (input_override += ...), which makes Kp
+// the integral term and Kd the proportional term of the throttle command. That
+// is why Ki can stay at 0 without leaving steady state droop.
+#define SPEED_PID_GAIN_SCHEDULING
+#define SPEED_PID_REF_RPM 12000 // rpm at which the reference gains below apply
+#define SPEED_PID_REF_KP 400
+#define SPEED_PID_REF_KD 500
+#define SPEED_PID_MAX_RATIO 2048 // clamp the schedule at 2x reference rpm (Q10)
+
+uint16_t speed_pid_ref_e_com_time = 0; // reference period, derived once from motor poles
 
 fastPID currentPid = { // 1khz loop time
     .Kp = 400,
@@ -603,6 +631,41 @@ int32_t doPidCalculations(struct fastPID* pidnow, int actual, int target)
     }
     return pidnow->pid_output;
 }
+
+#ifdef SPEED_PID_GAIN_SCHEDULING
+// Rescale the speed loop gains for the commutation period the motor is actually
+// running at, so the effective rpm domain gain matches the reference pair at
+// every speed. Called from the 1khz loop just before the speed PID runs.
+// The speed PID reads error = e_com_time - target_e_com_time, and e_com_time proportional to 1/RPM.
+// So an RPM error arrives at the PID attenuated by 1/RPM^2. Compensating exactly means scaling the
+// gains by RPM^2 - equivalently 1/e_com_time^2.
+void updateSpeedPidGains(int actual_e_com_time)
+{
+    if (actual_e_com_time <= 0) { // no valid commutation measurement yet
+        return;
+    }
+    if (speed_pid_ref_e_com_time == 0) { // motor poles are known once the eeprom is loaded
+        uint8_t pole_pairs = eepromBuffer.motor_poles / 2;
+        if (pole_pairs == 0) {
+            pole_pairs = 1;
+        }
+        speed_pid_ref_e_com_time = 60000000 / SPEED_PID_REF_RPM / pole_pairs;
+    }
+
+    // Q10 ratio of reference period to current period, which equals rpm / SPEED_PID_REF_RPM
+    uint32_t ratio = ((uint32_t)speed_pid_ref_e_com_time << 10) / (uint32_t)actual_e_com_time;
+    if (ratio > SPEED_PID_MAX_RATIO) {
+        ratio = SPEED_PID_MAX_RATIO;
+    }
+    uint32_t scale = ratio * ratio; // Q20, peaks at 4194304 so the products below stay in 32 bits
+
+    uint32_t scaled_kp = ((uint32_t)SPEED_PID_REF_KP * scale + (1 << 19)) >> 20;
+    uint32_t scaled_kd = ((uint32_t)SPEED_PID_REF_KD * scale + (1 << 19)) >> 20;
+
+    speedPid.Kp = scaled_kp > 0 ? scaled_kp : 1; // never let a gain round down to zero
+    speedPid.Kd = scaled_kd > 0 ? scaled_kd : 1;
+}
+#endif
 
 void loadEEpromSettings()
 {
@@ -1449,6 +1512,9 @@ void tenKhzRoutine()
                 }
             }
             if (use_speed_control_loop && running) {
+#ifdef SPEED_PID_GAIN_SCHEDULING
+                updateSpeedPidGains(e_com_time);
+#endif
                 input_override += doPidCalculations(&speedPid, e_com_time, target_e_com_time);
                 if (input_override > 2047 * 10000) {
                     input_override = 2047 * 10000;
