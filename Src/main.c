@@ -1512,9 +1512,6 @@ void tenKhzRoutine()
                 }
             }
             if (use_speed_control_loop && running) {
-#ifdef SPEED_PID_GAIN_SCHEDULING
-                updateSpeedPidGains(e_com_time);
-#endif
                 input_override += doPidCalculations(&speedPid, e_com_time, target_e_com_time);
                 if (input_override > 2047 * 10000) {
                     input_override = 2047 * 10000;
@@ -2249,6 +2246,20 @@ if(zero_crosses < 5){
 
             e_rpm = running * (600000 / e_com_time); // in tens of rpm
             k_erpm = e_rpm / 10; // ecom time is time for one electrical revolution in microseconds
+
+#ifdef SPEED_PID_GAIN_SCHEDULING
+            // Deliberately updated here in the main loop rather than in the 1khz
+            // block of tenKhzRoutine(). The gain schedule needs a 32 bit divide,
+            // and the G0 has no hardware divider, so running it inside the timer
+            // ISR stole time from the main loop. The main loop is what services
+            // send_telemetry, and send_telem_DMA() re-arms the DMA channel without
+            // checking whether the previous frame finished, so delaying it can cut
+            // a telemetry frame short. Speed changes slowly enough that main loop
+            // rate is more than sufficient here.
+            if (use_speed_control_loop && running) {
+                updateSpeedPidGains(e_com_time);
+            }
+#endif
 
             if (low_rpm_throttle_limit) { // some hardware doesn't need this, its on
                                           // by default to keep hardware / motors
