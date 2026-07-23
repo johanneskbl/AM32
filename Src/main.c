@@ -281,7 +281,7 @@ void zcfoundroutine(void);
 // must be set correctly in the config tool. Not to be used with sine startup mode.
 
 uint8_t drive_by_rpm = 1;  // RPM closed-loop control mode (1=enabled, 0=disabled)
-uint32_t MINIMUM_RPM_SPEED_CONTROL = 1000;
+uint32_t MINIMUM_RPM_SPEED_CONTROL = 785;
 uint32_t MAXIMUM_RPM_SPEED_CONTROL = 13300;
 
 // assign speed control PID values values are x10000
