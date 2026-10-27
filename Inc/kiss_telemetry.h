@@ -12,15 +12,21 @@ typedef struct __attribute__((packed))
     uint8_t current_l;
     uint8_t consumption_h; // accumulated current consumption in mAH
     uint8_t consumption_l;
-    uint8_t erpm_h; // eRPM * 100, so 1 in the packet means 100 eRPM
+    uint8_t erpm_h; // eRPM / 100, so 1 in the packet means 100 eRPM
     uint8_t erpm_l;
+    // Extension of the KISS frame:
+    // Rate of eRPM, i.e., rotor acceleration, as a signed 16-bit integer
+    // This is proportional to the thrust velocity at a fixed speed
+    // Spinal needs to be modified to receive this data, see spinal esc_telem.cpp
+    uint8_t erpm_rate_h; // signed eRPM rate / 100, so 1 in the packet means 100 eRPM/s
+    uint8_t erpm_rate_l;
     uint8_t crc;
 }
-kiss_telem_pkt_t; // sizeof(kiss_telem_pkt_t) = 10
+kiss_telem_pkt_t; // sizeof(kiss_telem_pkt_t) = 12
 
 extern uint8_t aTxBuffer[49] __attribute__((aligned(4)));
 
-void makeTelemPackage(int8_t temp, uint16_t voltage, uint16_t current, uint16_t consumption, uint16_t e_rpm);
+void makeTelemPackage(int8_t temp, uint16_t voltage, uint16_t current, uint16_t consumption, uint16_t e_rpm, int16_t erpm_rate);
 void makeInfoPacket(void);
 
 #endif

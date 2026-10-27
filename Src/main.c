@@ -227,6 +227,7 @@ an settings option)
 #include "phaseouts.h"
 #include "serial_telemetry.h"
 #include "kiss_telemetry.h"
+#include "rpm_rate.h"
 #include "signal.h"
 #include "sounds.h"
 #include "targets.h"
@@ -437,6 +438,9 @@ uint16_t commutation_intervals[6] = { 0 };
 volatile uint32_t average_interval = 0;
 uint32_t last_average_interval;
 int e_com_time;
+// e_com_time sampled in the 1 kHz block for the eRPM rate estimate (0 = motor not settled), consumed in the main loop
+volatile int rpm_rate_sample = 0;
+volatile uint8_t rpm_rate_sample_ready = 0;
 
 uint16_t ADC_smoothed_input = 0;
 volatile int16_t degrees_celsius;
@@ -1477,6 +1481,11 @@ void tenKhzRoutine()
                 speedPid.last_error = 0;
                 speedPid.integral = 0;
             }
+            // Sample the commutation period at this fixed rate for the eRPM rate estimate, once it is settled (same
+            // threshold as the speed loop). The estimate itself runs in the main loop to keep its divisions out of
+            // this interrupt, the G0 has no hardware divider.
+            rpm_rate_sample = (running && zero_crosses >= 100) ? e_com_time : 0;
+            rpm_rate_sample_ready = 1;
         }
         if (ramp_count > ramp_divider) {
           ramp_count = 0;
@@ -1918,6 +1927,20 @@ int main(void)
     while (1) {
 e_com_time = ((commutation_intervals[0] + commutation_intervals[1] + commutation_intervals[2] + commutation_intervals[3] + commutation_intervals[4] + commutation_intervals[5]) + 4) >> 1; // COMMUTATION INTERVAL IS 0.5US INCREMENTS 
 
+// RPM rate estimate
+// Sample the RPM rate at a fixed interval, and update it in the main loop to avoid doing divisions during interrupts
+if (rpm_rate_sample_ready) {
+    __disable_irq(); // take sample and flag together
+    int sample = rpm_rate_sample;
+    rpm_rate_sample_ready = 0;
+    __enable_irq();
+    if (sample > 0) {
+        rpmRateUpdate(sample);
+    } else {
+        rpmRateReset(e_com_time);
+    }
+}
+
 #if defined(FIXED_DUTY_MODE) || defined(FIXED_SPEED_MODE)
         setInput();
 #endif
@@ -2088,8 +2111,8 @@ if(zero_crosses < 5){
         if (send_telemetry) {
 #ifdef USE_SERIAL_TELEMETRY
             makeTelemPackage((int8_t)degrees_celsius, battery_voltage, actual_current,
-                (uint16_t)(consumed_current >> 16), e_rpm);
-            send_telem_DMA(10);
+                (uint16_t)(consumed_current >> 16), e_rpm, rpmRateTelemetry());
+            send_telem_DMA(sizeof(kiss_telem_pkt_t));
             send_telemetry = 0;
 #endif
         } else if(send_esc_info_flag ) {

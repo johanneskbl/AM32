@@ -6,7 +6,7 @@ extern uint8_t get_crc8(uint8_t* Buf, uint8_t BufLen);
 uint8_t aTxBuffer[49] __attribute__((aligned(4)));
 uint8_t nbDataToTransmit = sizeof(aTxBuffer);
 
-void makeTelemPackage(int8_t temp, uint16_t voltage, uint16_t current, uint16_t consumption, uint16_t e_rpm)
+void makeTelemPackage(int8_t temp, uint16_t voltage, uint16_t current, uint16_t consumption, uint16_t e_rpm, int16_t erpm_rate)
 {
     kiss_telem_pkt_t* telem_pkt = (kiss_telem_pkt_t*)aTxBuffer;
 
@@ -24,9 +24,13 @@ void makeTelemPackage(int8_t temp, uint16_t voltage, uint16_t current, uint16_t 
     telem_pkt->consumption_h = (consumption >> 8) & 0xFF;
     telem_pkt->consumption_l = consumption & 0xFF;
 
-    // eRPM * 100, so 1 in the packet means 100 eRPM
+    // eRPM / 100, so 1 in the packet means 100 eRPM
     telem_pkt->erpm_h = (e_rpm >> 8) & 0xFF;
     telem_pkt->erpm_l = e_rpm & 0xFF;
+
+    // eRPM rate / 100, so 1 in the packet means 100 eRPM/s
+    telem_pkt->erpm_rate_h = ((uint16_t)erpm_rate >> 8) & 0xFF;  // Two's-complement bit pattern
+    telem_pkt->erpm_rate_l = (uint16_t)erpm_rate & 0xFF;
 
     telem_pkt->crc = get_crc8((uint8_t*)telem_pkt, sizeof(kiss_telem_pkt_t) - 1);
 }
