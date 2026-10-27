@@ -286,12 +286,16 @@ uint32_t MINIMUM_RPM_SPEED_CONTROL = 785;
 uint32_t MAXIMUM_RPM_SPEED_CONTROL = 13300;
 
 // assign speed control PID values values are x10000
-fastPID speedPid = { // commutation speed loop time
+// The error is in mechanical RPM (target_rpm - measured_rpm). It used to be the commutation period error, whose
+// gain in RPM scales with 1/RPM^2, so one gain pair limit-cycled near idle and was sluggish near hover.
+// The output is accumulated into input_override every 1 kHz tick, so Kp acts as the integral term and Kd as the
+// proportional term of the throttle command.
+fastPID speedPid = { // 1khz loop time
     .Kp = 80,  // 10
     .Ki = 0,
-    .Kd = 100,  // 100
+    .Kd = 4000,  // 100
     .integral_limit = 10000,
-    .output_limit = 50000
+    .output_limit = 2047 * 10000 // no per-tick clamp, clipping the proportional kick slows the response a lot
 };
 
 uint16_t speed_pid_ref_e_com_time = 0; // reference period, derived once from motor poles
@@ -360,7 +364,8 @@ uint16_t ADC_CCR = 30;
 uint16_t current_angle = 90;
 uint16_t desired_angle = 90;
 char return_to_center = 0;
-uint16_t target_e_com_time = 0;
+uint16_t target_rpm = 0;   // Speed loop setpoint in mechanical RPM
+uint32_t measured_rpm = 0; // Mechanical RPM measured from e_com_time, updated in the main loop to keep the division out of the 1 kHz interrupt
 int16_t Speed_pid_output;
 char use_speed_control_loop = 0;
 int32_t input_override = 0;
@@ -1162,7 +1167,7 @@ void setInput()
             if (use_speed_control_loop) {
                 if (drive_by_rpm) {
                     // In stock: min DShot = 47, but standard is 48 (as implemented in flight controller "spinal")
-                    target_e_com_time = 60000000 / map(adjusted_input, 48, 2047, MINIMUM_RPM_SPEED_CONTROL, MAXIMUM_RPM_SPEED_CONTROL) / (eepromBuffer.motor_poles / 2);
+                    target_rpm = map(adjusted_input, 48, 2047, MINIMUM_RPM_SPEED_CONTROL, MAXIMUM_RPM_SPEED_CONTROL);
                     if (adjusted_input < 47) { // dead band ?
                         input = 0;
                         speedPid.error = 0;
@@ -1463,7 +1468,10 @@ void tenKhzRoutine()
                     speedPid.last_error = 0;
                     speedPid.integral = 0;
                 } else {
-                    input_override += doPidCalculations(&speedPid, e_com_time, target_e_com_time);
+                    // doPidCalculations() returns actual - target, which suits the commutation period of the stock loop
+                    // (too slow = too long = positive). For RPM, pass target first to get target - measured, otherwise
+                    // a too fast motor gets more throttle and runs away to full throttle.
+                    input_override += doPidCalculations(&speedPid, target_rpm, measured_rpm);
                     if (input_override > 2047 * 10000) {
                         input_override = 2047 * 10000;
                     }
@@ -1859,7 +1867,7 @@ int main(void)
 #ifdef FIXED_SPEED_MODE
     use_speed_control_loop = 1;
     eepromBuffer.use_sine_start = 0;
-    target_e_com_time = 60000000 / FIXED_SPEED_MODE_RPM / (eepromBuffer.motor_poles / 2);
+    target_rpm = FIXED_SPEED_MODE_RPM;
     input = 48;
 #endif
 
@@ -1926,6 +1934,8 @@ int main(void)
 
     while (1) {
 e_com_time = ((commutation_intervals[0] + commutation_intervals[1] + commutation_intervals[2] + commutation_intervals[3] + commutation_intervals[4] + commutation_intervals[5]) + 4) >> 1; // COMMUTATION INTERVAL IS 0.5US INCREMENTS 
+// Speed loop feedback, e_com_time is one electrical revolution in microseconds
+measured_rpm = e_com_time ? 60000000 / (eepromBuffer.motor_poles / 2) / e_com_time : 0;
 
 // RPM rate estimate
 // Sample the RPM rate at a fixed interval, and update it in the main loop to avoid doing divisions during interrupts
