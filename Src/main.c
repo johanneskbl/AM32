@@ -282,7 +282,7 @@ void zcfoundroutine(void);
 // must be set correctly in the config tool. Not to be used with sine startup mode.
 
 uint8_t drive_by_rpm = 1;  // RPM closed-loop control mode (1=enabled, 0=disabled)
-uint32_t MINIMUM_RPM_SPEED_CONTROL = 785;
+uint32_t MINIMUM_RPM_SPEED_CONTROL = 900;
 uint32_t MAXIMUM_RPM_SPEED_CONTROL = 13300;
 
 // assign speed control PID values values are x10000
@@ -291,12 +291,28 @@ uint32_t MAXIMUM_RPM_SPEED_CONTROL = 13300;
 // The output is accumulated into input_override every 1 kHz tick, so Kp acts as the integral term and Kd as the
 // proportional term of the throttle command.
 fastPID speedPid = { // 1khz loop time
-    .Kp = 80,  // 10
+    .Kp = 65,  // 10
     .Ki = 0,
     .Kd = 4000,  // 100
     .integral_limit = 10000,
     .output_limit = 2047 * 10000 // no per-tick clamp, clipping the proportional kick slows the response a lot
 };
+
+// Low-pass filter of the measured RPM in front of the speed PID, applied every speed loop tick (21 interrupts at
+// 20 kHz = 1.05 ms):
+//   filtered_rpm = filtered_rpm + weight / 256 * (measured_rpm - filtered_rpm)
+// Each tick the filtered RPM moves weight/256 of the way toward the newest measurement, so the influence of older
+// measurements fades by (256 - weight) / 256 per tick.
+// A larger weight follows the motor with less lag but lets more of the jitter through.
+// Valid range 1 (strongest filter) to 256 (off).
+//   weight   old value kept per tick   average lag   -3 dB    white noise passed
+//     256              0 %               0 ms          -         100 % (filter off)
+//     192             25 %               0.35 ms     257 Hz       77 %
+//     128             50 %               1.05 ms     110 Hz       58 %
+//      77             70 %               2.4 ms       55 Hz       42 %
+uint16_t speed_pid_filter_weight = 128;
+// Sanety check: Measured RPM above this is clamped before filtering
+#define SPEED_PID_FILTER_MAX_RPM 30000
 
 uint16_t speed_pid_ref_e_com_time = 0; // reference period, derived once from motor poles
 
@@ -366,6 +382,7 @@ uint16_t desired_angle = 90;
 char return_to_center = 0;
 uint16_t target_rpm = 0;   // Speed loop setpoint in mechanical RPM
 uint32_t measured_rpm = 0; // Mechanical RPM measured from e_com_time, updated in the main loop to keep the division out of the 1 kHz interrupt
+int32_t speed_pid_filtered_rpm_x256 = 0;
 int16_t Speed_pid_output;
 char use_speed_control_loop = 0;
 int32_t input_override = 0;
@@ -1166,8 +1183,17 @@ void setInput()
         } else {
             if (use_speed_control_loop) {
                 if (drive_by_rpm) {
-                    // In stock: min DShot = 47, but standard is 48 (as implemented in flight controller "spinal")
-                    target_rpm = map(adjusted_input, 48, 2047, MINIMUM_RPM_SPEED_CONTROL, MAXIMUM_RPM_SPEED_CONTROL);
+                    // DShot 48 -> MINIMUM, 2047 -> MAXIMUM
+                    // NOTE: This mapping must match the flight controller, i.e., spinal
+                    // NOTE: Stock AM32 uses 47 -> MINIMUM, 2047 -> MAXIMUM, but 48 is DShot standard
+                    if (adjusted_input <= 48) {
+                        target_rpm = MINIMUM_RPM_SPEED_CONTROL;
+                    } else if (adjusted_input >= 2047) {
+                        target_rpm = MAXIMUM_RPM_SPEED_CONTROL;
+                    } else {
+                        // Rounded division instead of map() to avoid bisection problems and to increase resolution accuracy
+                        target_rpm = MINIMUM_RPM_SPEED_CONTROL + ((adjusted_input - 48) * (MAXIMUM_RPM_SPEED_CONTROL - MINIMUM_RPM_SPEED_CONTROL) + 999) / 1999;
+                    }
                     if (adjusted_input < 47) { // dead band ?
                         input = 0;
                         speedPid.error = 0;
@@ -1461,17 +1487,30 @@ void tenKhzRoutine()
                 }
             }
             if (use_speed_control_loop && running) {
+                // Current clamped RPM measurement
+                int32_t newest_rpm = (measured_rpm > SPEED_PID_FILTER_MAX_RPM) ? SPEED_PID_FILTER_MAX_RPM : (int32_t)measured_rpm;
                 if (zero_crosses < (uint32_t)(30 >> eepromBuffer.stall_protection)) {
                     // Blind startup to avoid desynching the motor
                     input_override = map(last_duty_cycle, minimum_duty_cycle, 2000, 47, 2047) * 10000;
                     speedPid.error = 0;
                     speedPid.last_error = 0;
                     speedPid.integral = 0;
+                    // Low-pass filtered measured_rpm that the speed PID uses, in 1/256 RPM
+                    // Start the filter on the current speed, so that the PID does not see a jump from a stale value
+                    // when it takes over
+                    speed_pid_filtered_rpm_x256 = newest_rpm * 256;
                 } else {
+                    // Gap between the newest measurement and the filtered RPM, both in 1/256 RPM
+                    int32_t rpm_gap_x256 = newest_rpm * 256 - speed_pid_filtered_rpm_x256;
+                    // Moving weighted average filter
+                    speed_pid_filtered_rpm_x256 += rpm_gap_x256 * (int32_t)speed_pid_filter_weight / 256;
+                    // Map to whole RPM for the PID, rounded
+                    int32_t filtered_rpm = (speed_pid_filtered_rpm_x256 + 128) / 256;
+
                     // doPidCalculations() returns actual - target, which suits the commutation period of the stock loop
                     // (too slow = too long = positive). For RPM, pass target first to get target - measured, otherwise
                     // a too fast motor gets more throttle and runs away to full throttle.
-                    input_override += doPidCalculations(&speedPid, target_rpm, measured_rpm);
+                    input_override += doPidCalculations(&speedPid, target_rpm, filtered_rpm);
                     if (input_override > 2047 * 10000) {
                         input_override = 2047 * 10000;
                     }
@@ -2231,7 +2270,7 @@ if(zero_crosses < 5){
         stuckcounter = 0;
         if (stepper_sine == 0) {
 
-            e_rpm = running * (600000 / e_com_time); // in tens of rpm
+            e_rpm = running * ((600000 + e_com_time / 2) / e_com_time); // eRPM / 100, rounded: truncating read 50 eRPM low on average
             k_erpm = e_rpm / 10; // ecom time is time for one electrical revolution in microseconds
 
             if (low_rpm_throttle_limit) { // some hardware doesn't need this, its on
