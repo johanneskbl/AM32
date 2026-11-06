@@ -228,6 +228,7 @@ an settings option)
 #include "serial_telemetry.h"
 #include "kiss_telemetry.h"
 #include "rpm_rate.h"
+#include "rpm_filter.h"
 #include "signal.h"
 #include "sounds.h"
 #include "targets.h"
@@ -291,27 +292,14 @@ uint32_t MAXIMUM_RPM_SPEED_CONTROL = 13300;
 // The output is accumulated into input_override every 1 kHz tick, so Kp acts as the integral term and Kd as the
 // proportional term of the throttle command.
 fastPID speedPid = { // 1khz loop time
-    .Kp = 65,  // 10
+    .Kp = 80,  // 10
     .Ki = 0,
     .Kd = 4000,  // 100
     .integral_limit = 10000,
     .output_limit = 2047 * 10000 // no per-tick clamp, clipping the proportional kick slows the response a lot
 };
 
-// Low-pass filter of the measured RPM in front of the speed PID, applied every speed loop tick (21 interrupts at
-// 20 kHz = 1.05 ms):
-//   filtered_rpm = filtered_rpm + weight / 256 * (measured_rpm - filtered_rpm)
-// Each tick the filtered RPM moves weight/256 of the way toward the newest measurement, so the influence of older
-// measurements fades by (256 - weight) / 256 per tick.
-// A larger weight follows the motor with less lag but lets more of the jitter through.
-// Valid range 1 (strongest filter) to 256 (off).
-//   weight   old value kept per tick   average lag   -3 dB    white noise passed
-//     256              0 %               0 ms          -         100 % (filter off)
-//     192             25 %               0.35 ms     257 Hz       77 %
-//     128             50 %               1.05 ms     110 Hz       58 %
-//      77             70 %               2.4 ms       55 Hz       42 %
-uint16_t speed_pid_filter_weight = 128;
-// Sanety check: Measured RPM above this is clamped before filtering
+// Sanity check: Measured RPM above this is clamped before filtering
 #define SPEED_PID_FILTER_MAX_RPM 30000
 
 uint16_t speed_pid_ref_e_com_time = 0; // reference period, derived once from motor poles
@@ -382,7 +370,6 @@ uint16_t desired_angle = 90;
 char return_to_center = 0;
 uint16_t target_rpm = 0;   // Speed loop setpoint in mechanical RPM
 uint32_t measured_rpm = 0; // Mechanical RPM measured from e_com_time, updated in the main loop to keep the division out of the 1 kHz interrupt
-int32_t speed_pid_filtered_rpm_x256 = 0;
 int16_t Speed_pid_output;
 char use_speed_control_loop = 0;
 int32_t input_override = 0;
@@ -1486,31 +1473,32 @@ void tenKhzRoutine()
                     stall_protection_adjust = 0;
                 }
             }
-            if (use_speed_control_loop && running) {
+            // Low-pass filtered RPM for the speed PID and the telemetry frame
+            // During the blind startup it is held on the measurement, so the PID does not see a jump from a stale
+            // value when it takes over.
+            if (running) {
                 // Current clamped RPM measurement
                 int32_t newest_rpm = (measured_rpm > SPEED_PID_FILTER_MAX_RPM) ? SPEED_PID_FILTER_MAX_RPM : (int32_t)measured_rpm;
+                if (zero_crosses < (uint32_t)(30 >> eepromBuffer.stall_protection)) {
+                    rpmFilterReset(newest_rpm);
+                } else {
+                    rpmFilterUpdate(newest_rpm);
+                }
+            } else {
+                rpmFilterReset(0);
+            }
+            if (use_speed_control_loop && running) {
                 if (zero_crosses < (uint32_t)(30 >> eepromBuffer.stall_protection)) {
                     // Blind startup to avoid desynching the motor
                     input_override = map(last_duty_cycle, minimum_duty_cycle, 2000, 47, 2047) * 10000;
                     speedPid.error = 0;
                     speedPid.last_error = 0;
                     speedPid.integral = 0;
-                    // Low-pass filtered measured_rpm that the speed PID uses, in 1/256 RPM
-                    // Start the filter on the current speed, so that the PID does not see a jump from a stale value
-                    // when it takes over
-                    speed_pid_filtered_rpm_x256 = newest_rpm * 256;
                 } else {
-                    // Gap between the newest measurement and the filtered RPM, both in 1/256 RPM
-                    int32_t rpm_gap_x256 = newest_rpm * 256 - speed_pid_filtered_rpm_x256;
-                    // Moving weighted average filter
-                    speed_pid_filtered_rpm_x256 += rpm_gap_x256 * (int32_t)speed_pid_filter_weight / 256;
-                    // Map to whole RPM for the PID, rounded
-                    int32_t filtered_rpm = (speed_pid_filtered_rpm_x256 + 128) / 256;
-
                     // doPidCalculations() returns actual - target, which suits the commutation period of the stock loop
                     // (too slow = too long = positive). For RPM, pass target first to get target - measured, otherwise
                     // a too fast motor gets more throttle and runs away to full throttle.
-                    input_override += doPidCalculations(&speedPid, target_rpm, filtered_rpm);
+                    input_override += doPidCalculations(&speedPid, target_rpm, getFilteredRPM());
                     if (input_override > 2047 * 10000) {
                         input_override = 2047 * 10000;
                     }
@@ -1974,7 +1962,8 @@ int main(void)
     while (1) {
 e_com_time = ((commutation_intervals[0] + commutation_intervals[1] + commutation_intervals[2] + commutation_intervals[3] + commutation_intervals[4] + commutation_intervals[5]) + 4) >> 1; // COMMUTATION INTERVAL IS 0.5US INCREMENTS 
 // Speed loop feedback, e_com_time is one electrical revolution in microseconds
-measured_rpm = e_com_time ? 60000000 / (eepromBuffer.motor_poles / 2) / e_com_time : 0;
+// Rounded: truncating read 0.5 rpm (3.5 eRPM) low on average, a third of the eRPM / 10 telemetry step
+measured_rpm = e_com_time ? (60000000 / (eepromBuffer.motor_poles / 2) + e_com_time / 2) / e_com_time : 0;
 
 // RPM rate estimate
 // Sample the RPM rate at a fixed interval, and update it in the main loop to avoid doing divisions during interrupts
@@ -2159,8 +2148,11 @@ if(zero_crosses < 5){
 #endif
         if (send_telemetry) {
 #ifdef USE_SERIAL_TELEMETRY
+            // eRPM / 10 from the same filtered RPM the speed PID uses. Sine mode skips the 1 kHz block that updates
+            // the filter, so it falls back to e_rpm (eRPM / 100) there.
+            uint16_t telem_e_rpm = !stepper_sine ? getFilteredRPMForTelemetry(eepromBuffer.motor_poles / 2) : (uint16_t)(e_rpm * 10);
             makeTelemPackage((int8_t)degrees_celsius, battery_voltage, actual_current,
-                (uint16_t)(consumed_current >> 16), e_rpm, rpmRateTelemetry());
+                (uint16_t)(consumed_current >> 16), telem_e_rpm, getEstimatedRPMRateForTelemetry());
             send_telem_DMA(sizeof(kiss_telem_pkt_t));
             send_telemetry = 0;
 #endif

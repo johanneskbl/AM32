@@ -8,34 +8,22 @@
  *   e_com_time T is the duration of the last electrical revolution (sum of the last six commutation intervals,
  *   see main.c), so every sample yields the speed averaged over that revolution:
  *     z = 60e6 / T  [eRPM]
+ *   Samples arrive every dt = 1.05 ms from the 1 kHz block of tenKhzRoutine().
  *
- * Model and filter
- *   Constant-rate model with x = eRPM and v = eRPM rate [eRPM/s], sampled every dt:
- *     x[k+1] = x[k] + v[k]*dt,   v[k+1] = v[k]
- *   tracked by an alpha-beta filter, which has the structure of the steady-state (fixed-gain) Kalman filter
- *   of this model:
- *     predict: x- = x + v*dt
- *     correct: r = z - x-,  x = x- + alpha*r,  v = v + (beta/dt)*r
- *
- * Gain design (pole placement, not noise covariances)
- *   The estimation error evolves with the characteristic polynomial  z^2 - (2 - alpha - beta)*z + (1 - alpha).
- *   alpha = 1 - p^2 and beta = (1 - p)^2 turn it into (z - p)^2, a critically damped double pole at
- *     p = exp(-2*pi*f*dt).
- *   The rate output is then exactly a backward difference followed by two identical unit-gain exponential
- *   moving averages:
- *     V(z) = (1 - z^-1) / dt * ((1 - p) / (1 - p*z^-1))^2 * Z(z)
- *   whose continuous-time equivalent is s / (1 + s/(2*pi*f))^2. So f is the pole frequency, not the -3 dB
- *   bandwidth. For white acceleration noise the Kalman-optimal beta at this alpha would be 2*(1 - p)^2
- *   (damping ~0.71). The critically damped choice halves it: a monotone rate estimate without overshoot,
- *   for slightly more delay.
- *
- * Resulting behaviour for f = 30 Hz and dt = 1.05 ms
- *   - delay of a slowly varying rate:          (2*p/(1 - p) + 1/2) * dt = 10.1 ms
- *   - gain relative to the exact derivative:   ~ 1 / (1 + (F/f)^2) at frequency F, -3 dB at 19.3 Hz
- *   - response to an acceleration step a:      a * (1 - (1 + t/tau)*exp(-t/tau)), tau = 5.3 ms,
- *                                              10-90 % in 17.8 ms, no overshoot, no steady-state error
- *   - white measurement noise sigma_z [eRPM]:  sigma_v = sigma_z * (1 - p)^1.5 / dt * sqrt(2 / (1 + p)^3)
- *                                              = 41.7/s * sigma_z (a raw difference gives 1347/s * sigma_z)
+ * Savitzky-Golay derivative: quadratic fit over the last N = 2m + 1 = 17 samples, differentiated at the centre
+ *   1. Fit samples: The samples get the index j \in [-m,...,m] counted from the centre sample: j = 0 is m samples old,
+ *      j = m is the newest. A quadratic is fitted to them by least squares:
+ *        p(j) = c0 + c1*j + c2*j^2,   minimising  sum_j (z_j - p(j))^2
+ *      The window is symmetric about j = 0, so the normal equations decouple. The odd coefficient depends only on
+ *      the odd moment of the data:
+ *        c1 = sum_j j*z_j / sum_j j^2
+ *      while c0 and c2 follow from sum_j z_j and sum_j j^2*z_j alone.
+ *   2. Differentiate at the centre. dp/dj = c1 + 2*c2*j, so the slope at j = 0 is c1 [eRPM per sample]. c0 and c2
+ *      do not enter it, which is why they are not computed. Per second:
+ *        rate = c1 / dt  [eRPM/s]
+ *   Together this is a fixed weighted sum of the samples, weights j / (dt * sum j^2): a linear-phase FIR filter.
+ *   Its delay is exactly m samples (8 * 1.05 = 8.4 ms) at all frequencies, plus the averaging over one electrical
+ *   revolution in e_com_time.
  *
  * Integer arithmetic only. Called from the main loop with the e_com_time samples taken at the fixed rate of the
  * 1 kHz block in tenKhzRoutine(), which keeps the divisions out of the interrupt.
@@ -47,36 +35,33 @@
 // The samples come from the 1 kHz block of tenKhzRoutine(), which runs every (PID_LOOP_DIVIDER + 1) interrupts,
 // so dt = RPM_RATE_TICKS_PER_UPDATE / LOOP_FREQUENCY_HZ = 21 / 20000 s = 1.05 ms at 20 kHz
 #define RPM_RATE_TICKS_PER_UPDATE (PID_LOOP_DIVIDER + 1)
+// Update frequency of 1 / dt in Hz, rounded (952 at 20 kHz, -0.04 %)
+#define RPM_RATE_UPDATE_HZ ((LOOP_FREQUENCY_HZ + RPM_RATE_TICKS_PER_UPDATE / 2) / RPM_RATE_TICKS_PER_UPDATE)
 
-// Gains in fixed point, alpha in Q11 (x 2048) and beta in Q16 (x 65536), for f = 30 Hz at dt = 1.05 ms.
-// They are tied to this dt: with another dt the poles stay at p, so f scales with 1.05 ms / dt.
-// Other choices of f (alpha / beta, delay): 15 Hz: 368 / 582, 20.7 ms; 20 Hz: 475 / 1001, 15.4 ms;
-// 25 Hz: 575 / 1515, 12.2 ms; 40 Hz: 840 / 3526, 7.5 ms. The delay scales with 1/f, the noise with f^1.5.
-#ifndef RPM_RATE_ALPHA_Q11
-#define RPM_RATE_ALPHA_Q11 670 // alpha = 670 / 2048 = 0.3271 (design value 0.3269)
+// Window of N = 2m + 1 samples, j \in [-m,...,m]
+#define RPM_RATE_SG_HALF_WINDOW 8
+#define RPM_RATE_SG_WINDOW (2 * RPM_RATE_SG_HALF_WINDOW + 1)
+// Scaling factor: sum_j j^2 over j \in [-m,...,m] = m(m + 1)(2m + 1) / 3, 408 for m = 8
+#define RPM_RATE_SG_SUM_J2 \
+    (RPM_RATE_SG_HALF_WINDOW * (RPM_RATE_SG_HALF_WINDOW + 1) * (2 * RPM_RATE_SG_HALF_WINDOW + 1) / 3)
+
+// Sanity check for corrupted periods, single outliers are replaced by the previous sample, a persistent jump (e.g. after a re-sync)
+// restarts the window on the measurement. The bound also keeps the fit sum below in int32. Zero-crossing jitter
+// alone moves the samples by ~1300 eRPM RMS (peaks ~4800) at 13 000 rpm, so the gate is wider than the 4096 eRPM
+// of the former filter.
+#ifndef RPM_RATE_OUTLIER_Q4
+#define RPM_RATE_OUTLIER_Q4 131072L // 8192 eRPM
 #endif
-#ifndef RPM_RATE_BETA_Q16
-#define RPM_RATE_BETA_Q16 2113 // beta = 2113 / 65536 = 0.03224
-#endif
+#define RPM_RATE_MAX_OUTLIERS 8     // consecutive outliers tolerated before the restart
+// Rate limit, also keeps c1 * RPM_RATE_UPDATE_HZ in int32
+#define RPM_RATE_MAX_ERPM_RATE 4000000L // eRPM/s
+#define RPM_RATE_MAX_C1_Q8 (RPM_RATE_MAX_ERPM_RATE * 256 / RPM_RATE_UPDATE_HZ)
 
-// beta/dt in Q10, applied to the Q4 residual: beta * LOOP_FREQUENCY_HZ / (16 * RPM_RATE_TICKS_PER_UPDATE)
-// The velocity correction is (beta/dt) * r with r = residual_q4 / 16 eRPM, i.e. beta / (16 * dt) eRPM/s per Q4 count
-// (= 1.919 for the gains above, 1965 in Q10). Computed at compile time in 64 bit to avoid overflow.
-#define RPM_RATE_KV_Q10 ((int32_t)((RPM_RATE_BETA_Q16 * 1024ULL * LOOP_FREQUENCY_HZ) / (65536ULL * 16ULL * RPM_RATE_TICKS_PER_UPDATE)))
-
-// A rotor cannot move 4096 eRPM away from the prediction within one update, so such a residual is a corrupted
-// period. Single outliers are skipped, a persistent jump (e.g. after a re-sync) restarts the filter on the measurement.
-// A sudden acceleration step a causes a peak residual of 2.26 * a * dt, so real motion trips this gate only above
-// ~1.7e6 eRPM/s. Measurement noise stays below it (simulated sample-to-sample jumps < 1600 eRPM up to 13 300 rpm).
-#define RPM_RATE_OUTLIER_Q4 65536L   // 4096 eRPM
-#define RPM_RATE_MAX_OUTLIERS 8      // consecutive outliers tolerated before the restart
-#define RPM_RATE_MAX_ERPM_RATE 4000000L // eRPM/s, keeps erpm_rate * 16 * RPM_RATE_TICKS_PER_UPDATE in int32 (< 1.35e9)
-
-// Filter state: x = erpm_q4 / 16 [eRPM] and v = erpm_rate [eRPM/s]. x carries 4 fractional bits because the
-// prediction step v*dt is small (1 eRPM per update at v = 950 eRPM/s) and would otherwise be lost to truncation.
-static int32_t erpm_q4;                  // x, filtered eRPM in 1/16 eRPM
-static int32_t erpm_rate;                // v, eRPM/s
-static uint8_t outlier_count;            // consecutive gated (skipped) updates
+// Ring buffer of the last N measurements z in 1/16 eRPM. window_q4[oldest] is j = -m and is overwritten next.
+static int32_t window_q4[RPM_RATE_SG_WINDOW];
+static uint8_t oldest;
+static int32_t newest_q4;                // last sample entered, for the outlier gate
+static uint8_t outlier_count;            // consecutive replaced samples
 static int16_t erpm_rate_telem;          // eRPM/s / 100, as sent in the telemetry frame
 
 // Measurement z in Q4: 16 * 60e6 / T = 960e6 / T for T in us per electrical revolution (T > 0). 960e6 fits in
@@ -86,56 +71,76 @@ static int32_t periodToErpmQ4(int e_com_time_us)
     return (int32_t)(960000000UL / (uint32_t)e_com_time_us); // 60e6 us per minute * 16
 }
 
-// Restart at rest on the current measurement (x = z, v = 0), so the next update only sees the motion of one dt
-// instead of a jump from a stale state. v then settles to the true rate within ~30 ms (98 % of an acceleration step).
+// Restart with every sample of the window on the current measurement, i.e. at a rate of zero.
 // Called by main.c while the motor is not settled, and below after a persistent run of outliers.
 void rpmRateReset(int e_com_time_us)
 {
-    erpm_q4 = (e_com_time_us > 0) ? periodToErpmQ4(e_com_time_us) : 0;
-    erpm_rate = 0;
+    int32_t z_q4 = (e_com_time_us > 0) ? periodToErpmQ4(e_com_time_us) : 0;
+    for (uint8_t i = 0; i < RPM_RATE_SG_WINDOW; i++) {
+        window_q4[i] = z_q4;
+    }
+    oldest = 0;
+    newest_q4 = z_q4;
     outlier_count = 0;
     erpm_rate_telem = 0;
 }
 
-// One filter step per 1 kHz sample, see the equations at the top of this file.
+// One estimation step per 1 kHz sample: enter the sample, fit the window, differentiate at its centre
 void rpmRateUpdate(int e_com_time_us)
 {
-    // Defensive: main.c only passes valid periods and calls rpmRateReset() for the rest
     if (e_com_time_us <= 0) {
         return;
     }
 
-    // Predict x- = x + v*dt in Q4, where 16*v*dt = v * (16 * RPM_RATE_TICKS_PER_UPDATE) / LOOP_FREQUENCY_HZ.
-    // The division truncates toward zero, which biases v by at most (1/16 eRPM) / dt = 60 eRPM/s (< 1 telemetry count).
-    int32_t predicted_q4 = erpm_q4 + (erpm_rate * (16 * RPM_RATE_TICKS_PER_UPDATE)) / LOOP_FREQUENCY_HZ;
-    // Innovation r = z - x- in Q4
-    int32_t residual_q4 = periodToErpmQ4(e_com_time_us) - predicted_q4;
-    // Gate: an implausible residual is not used. The filter coasts on its prediction with v unchanged and restarts on
-    // the measurement once more than RPM_RATE_MAX_OUTLIERS samples in a row were rejected.
-    if (residual_q4 > RPM_RATE_OUTLIER_Q4 || residual_q4 < -RPM_RATE_OUTLIER_Q4) {
+    // Gate, see RPM_RATE_OUTLIER_Q4
+    int32_t z_q4 = periodToErpmQ4(e_com_time_us);
+    int32_t jump_q4 = z_q4 - newest_q4;
+    if (jump_q4 > RPM_RATE_OUTLIER_Q4 || jump_q4 < -RPM_RATE_OUTLIER_Q4) {
         if (++outlier_count > RPM_RATE_MAX_OUTLIERS) {
             rpmRateReset(e_com_time_us);
-        } else {
-            erpm_q4 = predicted_q4;
+            return;
         }
-        return;
-    }
-    outlier_count = 0;
-
-    // Correct x = x- + alpha*r (Q4 * Q11 / 2^11 = Q4) and v = v + (beta/dt)*r (Q4 count * Q10 gain / 2^10 = eRPM/s).
-    // The gate bounds |r| <= 65536, so both products fit in int32. Dividing instead of shifting truncates toward zero
-    // for either sign, so positive and negative residuals are treated symmetrically.
-    erpm_q4 = predicted_q4 + (residual_q4 * RPM_RATE_ALPHA_Q11) / 2048;
-    erpm_rate += (residual_q4 * RPM_RATE_KV_Q10) / 1024;
-    if (erpm_rate > RPM_RATE_MAX_ERPM_RATE) {
-        erpm_rate = RPM_RATE_MAX_ERPM_RATE;
-    }
-    if (erpm_rate < -RPM_RATE_MAX_ERPM_RATE) {
-        erpm_rate = -RPM_RATE_MAX_ERPM_RATE;
+        z_q4 = newest_q4;
+    } else {
+        outlier_count = 0;
     }
 
-    // Telemetry value v / 100 (truncated toward zero), saturated to the int16 range of the frame (+-3.28e6 eRPM/s)
-    int32_t telem = erpm_rate / 100;
+    // Enter the sample in place of the oldest one, which moves the window on by one sample
+    window_q4[oldest] = z_q4;
+    newest_q4 = z_q4;
+    oldest = (oldest + 1 == RPM_RATE_SG_WINDOW) ? 0 : oldest + 1;
+
+    // Step 1: fit p(j) = c0 + c1*j + c2*j^2 to the window, of which only c1 = sum_j j*z_j / sum_j j^2 is needed.
+    // Since sum_j j = 0, summing j * (z_j - z_0) gives the same result, and the gate bounds every term:
+    // |z_j - z_0| <= 8 * 131072, so |sum| <= 72 * 8 * 131072 < 2^27 and the * 16 below stays in int32.
+    uint8_t centre = oldest + RPM_RATE_SG_HALF_WINDOW;
+    if (centre >= RPM_RATE_SG_WINDOW) {
+        centre -= RPM_RATE_SG_WINDOW;
+    }
+    const int32_t z_centre_q4 = window_q4[centre];
+    int32_t sum_jz_q4 = 0;
+    uint8_t i = oldest; // j = -m
+    // Kept as a loop: -O3 would unroll it to ~850 bytes, which overflows the 27 KB flash of the E230 targets
+#pragma GCC unroll 1
+    for (int32_t j = -RPM_RATE_SG_HALF_WINDOW; j <= RPM_RATE_SG_HALF_WINDOW; j++) {
+        sum_jz_q4 += j * (window_q4[i] - z_centre_q4);
+        i = (i + 1 == RPM_RATE_SG_WINDOW) ? 0 : i + 1;
+    }
+    // c1 in 1/256 eRPM per sample (the sum is in 1/16 eRPM, times 16)
+    int32_t c1_q8 = sum_jz_q4 * 16 / RPM_RATE_SG_SUM_J2;
+
+    // Step 2: differentiate p at the centre, p'(0) = c1 per sample, and convert to per second: rate = c1 / dt
+    if (c1_q8 > RPM_RATE_MAX_C1_Q8) {
+        c1_q8 = RPM_RATE_MAX_C1_Q8;
+    }
+    if (c1_q8 < -RPM_RATE_MAX_C1_Q8) {
+        c1_q8 = -RPM_RATE_MAX_C1_Q8;
+    }
+    int32_t erpm_rate = c1_q8 * RPM_RATE_UPDATE_HZ / 256; // eRPM/s
+
+    // Telemetry value rate / 100, rounded to nearest (truncation read up to 99 eRPM/s toward zero), saturated to
+    // the int16 range of the frame
+    int32_t telem = (erpm_rate >= 0 ? erpm_rate + 50 : erpm_rate - 50) / 100;
     if (telem > INT16_MAX) {
         telem = INT16_MAX;
     }
@@ -146,8 +151,9 @@ void rpmRateUpdate(int e_com_time_us)
 }
 
 // Latest estimate in units of 100 eRPM/s, held between updates and 0 while the motor is not settled.
+// It describes the rotor half a window (8.4 ms) before the newest sample.
 // makeTelemPackage() sends it as a big-endian two's-complement int16.
-int16_t rpmRateTelemetry(void)
+int16_t getEstimatedRPMRateForTelemetry(void)
 {
     return erpm_rate_telem;
 }

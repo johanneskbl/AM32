@@ -12,6 +12,6 @@
 
 void rpmRateReset(int e_com_time_us);
 void rpmRateUpdate(int e_com_time_us);
-int16_t rpmRateTelemetry(void); // eRPM rate / 100, so 1 means 100 eRPM/s
+int16_t getEstimatedRPMRateForTelemetry(void); // eRPM rate / 100, so 1 means 100 eRPM/s
 
 #endif /* RPM_RATE_H_ */

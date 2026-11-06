@@ -24,7 +24,7 @@ void makeTelemPackage(int8_t temp, uint16_t voltage, uint16_t current, uint16_t 
     telem_pkt->consumption_h = (consumption >> 8) & 0xFF;
     telem_pkt->consumption_l = consumption & 0xFF;
 
-    // eRPM / 100, so 1 in the packet means 100 eRPM
+    // eRPM / 10, so 1 in the packet means 10 eRPM
     telem_pkt->erpm_h = (e_rpm >> 8) & 0xFF;
     telem_pkt->erpm_l = e_rpm & 0xFF;
 
