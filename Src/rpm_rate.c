@@ -7,7 +7,7 @@
  * Measurement
  *   e_com_time T is the duration of the last electrical revolution (sum of the last six commutation intervals,
  *   see main.c), so every sample yields the speed averaged over that revolution:
- *     z = 60e6 / T  [eRPM]
+ *     z = 60 * 10^6 / T  [eRPM]
  *   Samples arrive every dt = 1.05 ms from the 1 kHz block of tenKhzRoutine().
  *
  * Savitzky-Golay derivative: quadratic fit over the last N = 2m + 1 = 17 samples, differentiated at the centre
@@ -64,7 +64,7 @@ static int32_t newest_q4;                // last sample entered, for the outlier
 static uint8_t outlier_count;            // consecutive replaced samples
 static int16_t erpm_rate_telem;          // eRPM/s / 100, as sent in the telemetry frame
 
-// Measurement z in Q4: 16 * 60e6 / T = 960e6 / T for T in us per electrical revolution (T > 0). 960e6 fits in
+// Measurement z in Q4: 16 * 60 * 10^6 / T = 960e6 / T for T in us per electrical revolution (T > 0). 960e6 fits in
 // uint32 and the quotient in int32 for any T >= 1. This is one software division, the G0 has no hardware divider.
 static int32_t periodToErpmQ4(int e_com_time_us)
 {
