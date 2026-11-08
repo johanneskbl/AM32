@@ -2,7 +2,7 @@
  * rpm_rate.c
  *
  * Time derivative of the electrical RPM (eRPM rate, i.e. rotor acceleration) for the extended KISS telemetry frame,
- * fitted to the zero-crossing (ZC) times that the commutation ISRs record (zc_capture.c).
+ * fitted to the zero-crossing (ZC) times that the commutation routines log in zc_log (main.c).
  *
  * Why the crossings and not e_com_time
  *   e_com_time averages over one electrical revolution and is smoothed by the commutation_interval filter.
@@ -10,7 +10,7 @@
  *   preserves the full information content including timing jitter. At the same delay a far less noisy
  *   estimate is possible.
  *
- * 1. Timestamp crossings through zcCaptureRead()
+ * 1. Timestamp crossings in zc_log
  *    Take timestamps t_k [us] from the free-running UTILITY_TIMER, unwrapped to a 32 bit integer.
  *    Note, this is not equal to the sum of thiszctime since INTERVAL_TIMER is reset at every crossing and
  *    loses a tick about every fifth time.
@@ -18,9 +18,12 @@
  *    t_k is replaced by the midpoint of its neighbours when
  *      |t_k - (t_{k-1} + t_{k+1}) / 2| > interval / 4,   interval = (t_{k+3} - t_{k-3}) / 6
  *    It reads only the raw neighbouring times and doesn't use stored data, so it cannot lock out.
- *    The window restarts at a record flagged GAP (ring overrun) or STARTUP, at a change of direction or detection
- *    mode (polling finds the crossing ~0.1 ms later), at a step that does not follow, and at an interval outside
- *    (0, 22.5 ms].
+ *    The window restarts when the log was overrun, at a record flagged STARTUP, at a change of direction, at a step
+ *    that does not follow, and at an interval outside (0, 22.5 ms].
+ *    It does not restart when the detection changes between comparator and polling (~1430 rpm up, ~1140 rpm down
+ *    with 7 pole pairs, higher with bi_direction):
+ *    polling finds the crossings 0.1-0.2 ms later, which shows as a blip of ~600-1200 rpm/s for one window, while a
+ *    restart would hold the output for ~70 ms right where the rotor spins down or up.
  * 2. Average electrical revolutions
  *    Sample down the crossings: P_j = sum of 6 consecutive checked crossing times which represent one electrical
  *    revolution with each comparator input, so the per-phase timing offsets cancel out.
@@ -31,7 +34,7 @@
  *      T = (t_2-t_1) + ... + (t_7-t_6) = t_7 − t_1,
  *    the intervals telescope, so the four crossings in between cancel exactly.
  *    Only the two boundary crossings are left, and their jitter adds.
- *    The window of this Savgol filter holds as many points needed to span the last 42 ms. Its sums
+ *    The window of this Savgol filter holds as many points needed to span the last 42 ms, but at least 5. Its sums
  *      S0 = sum y, S1 = sum u*y, S2 = sum u^2*y
  *    run along with it, with u = 0..n-1 and y = P - P_oldest counted from the oldest point,
  *    which therefore adds nothing. A new point is added in O(1). Dropping the oldest moves the origin
@@ -68,7 +71,6 @@
  */
 
 #include "rpm_rate.h"
-#include "zc_capture.h"
 
 // Fitting window
 #define RPM_RATE_WINDOW_US 42000L
@@ -100,10 +102,11 @@
 // Quotient bits of divideU64(). |rate| <= RPM_RATE_MAX_ERPM_RATE needs q = |rate| * 24 (N^2 - 4) / eRPM below
 // 3.2e6 < 2^23 for every window (largest at N = 95 and 137 000 eRPM), so larger quotients are not plausible.
 #define RPM_RATE_QUOTIENT_BITS 23
-// Records taken per read, so one update has a bounded run time (the rest waits in the capture ring)
+// Records taken per read, so one update has a bounded run time (the rest waits in zc_log)
 #define RPM_RATE_READ_BATCH 16
 #define RPM_RATE_MAX_READS 2 // batches per update: 32 records cover 3.4 ms at 13 300 rpm
 
+static uint32_t zc_log_tail; // records taken from zc_log
 // Last crossing times [us] in a ring of 8, crossing[cross_newest] newest, and how many belong to the current run
 static uint32_t crossing[8];
 static uint32_t cross_newest;
@@ -177,7 +180,8 @@ static uint32_t divideU64(uint64_t num, uint32_t d)
 }
 
 // Drop the oldest point and move the origin of the sums to the next one, see the top. All points lie within
-// 6 * 42 ms (252 000) of each other, so S0 < 2^25, S1 < 2^31, S2 < 2^37 and every product below fits int64.
+// 6 * 42 ms (252 000) of each other, so S0 < 2^25, S1 < 2^31, S2 < 2^37 and every product below fits int64. A window
+// stretched at low speed has at most 5 points within 6 * 4 * 135 ms (3.24e6), which stays below these bounds.
 static void dropOldest(void)
 {
     uint8_t next = revIndex(1);
@@ -198,8 +202,11 @@ static const uint8_t next_step_of[16] = { 0, 2, 3, 4, 5, 6, 1, 0, 0, 6, 1, 2, 3,
 __attribute__((noinline)) static void addRevolution(uint32_t point)
 {
     while (revs > 0 && (revs == RPM_RATE_MAX_REVS || point - rev[rev_oldest] > 6UL * RPM_RATE_WINDOW_US)) {
-        dropOldest(); // points are sums of six times
-        window_full = 1;
+        window_full = 1; // points are sums of six times
+        if (revs < RPM_RATE_MIN_REVS) {
+            break; // low speed: keep RPM_RATE_MIN_REVS - 1 points besides the new one
+        }
+        dropOldest();
     }
     if (revs == 0) {
         rev_oldest = 0;
@@ -208,7 +215,7 @@ __attribute__((noinline)) static void addRevolution(uint32_t point)
         s2 = 0;
     }
     uint32_t u = revs;
-    uint32_t y = (revs == 0) ? 0 : point - rev[rev_oldest]; // at most 252 000, so u^2 * y < 2^32
+    uint32_t y = (revs == 0) ? 0 : point - rev[rev_oldest]; // <= 252 000, or 3.24e6 for u <= 4: u^2 * y < 2^32
     rev[revIndex((uint8_t)u)] = point;
     s0 += y;
     s1 += u * y;
@@ -221,18 +228,19 @@ __attribute__((noinline)) static void addRevolution(uint32_t point)
 // Called for every crossing, so it stays out of line and small; the rarer work is in addRevolution().
 __attribute__((noinline)) static void addCrossing(uint32_t record)
 {
-    uint32_t flags = ZC_CAPTURE_FLAGS(record);
+    uint32_t flags = record & 0xFF;
+    uint32_t time_us = record >> 16;
     uint32_t previous = last_flags;
     last_flags = flags;
-    uint32_t interval = (ZC_CAPTURE_TIME_US(record) - clock_us) & 0xFFFF;
-    uint32_t next_step = next_step_of[(previous & ZC_CAPTURE_STEP_MASK) | ((flags & ZC_CAPTURE_FORWARD) ^ ZC_CAPTURE_FORWARD)];
-    // Sanity checks: lost records, start-up, change of direction or detection mode, missing next step,
+    uint32_t interval = (time_us - clock_us) & 0xFFFF;
+    uint32_t next_step = next_step_of[(previous & ZC_LOG_STEP_MASK) | ((flags & ZC_LOG_FORWARD) ^ ZC_LOG_FORWARD)];
+    // Sanity checks: start-up, change of direction, missing next step,
     // timestamp outside interval (0, 22.5 ms] (interval - 1 wraps for 0)
-    uint32_t run_break = (flags & (ZC_CAPTURE_GAP | ZC_CAPTURE_STARTUP))
-        | ((flags ^ previous) & (ZC_CAPTURE_FORWARD | ZC_CAPTURE_POLLING)) | ((flags & ZC_CAPTURE_STEP_MASK) ^ next_step);
+    uint32_t run_break = (flags & ZC_LOG_STARTUP) | ((flags ^ previous) & ZC_LOG_FORWARD)
+        | ((flags & ZC_LOG_STEP_MASK) ^ next_step);
     if (run_break || crossings == 0 || interval - 1 >= RPM_RATE_MAX_INTERVAL_US) {
         restartWindow();
-        clock_us = ZC_CAPTURE_TIME_US(record); // a new run: only differences within it matter
+        clock_us = time_us; // a new run: only differences within it matter
     } else {
         clock_us += interval;
     }
@@ -323,16 +331,39 @@ static uint8_t fitRate(int32_t* rate)
     return 1;
 }
 
-// Restart while the motor is not settled: drop the queued crossings, rate 0. The first plausible fit afterwards has
+// Take up to max records in order from zc_log, without masking interrupts. Records the ISR overwrote before they
+// were read restart the window, so crossings on both sides of the loss are never treated as consecutive.
+static uint8_t readCrossings(uint32_t* records, uint8_t max)
+{
+    uint32_t pending = zc_log_head - zc_log_tail;
+    if (pending > ZC_LOG_SIZE) {
+        restartWindow(); // continue with the oldest record still in the log
+        zc_log_tail = zc_log_head - ZC_LOG_SIZE;
+        pending = ZC_LOG_SIZE;
+    }
+    if (pending > max) {
+        pending = max;
+    }
+    // Kept as a loop: -O3 would unroll it (~400 bytes)
+#pragma GCC unroll 1
+    for (uint32_t i = 0; i < pending; i++) {
+        records[i] = zc_log[(zc_log_tail + i) & (ZC_LOG_SIZE - 1)];
+    }
+    // The ISR may have run during the copy. The slot of record zc_log_tail is reused by record zc_log_tail + SIZE,
+    // after which the head is past zc_log_tail + SIZE: then the copy may hold newer records. Drop it; the next call
+    // finds the overrun above.
+    if (zc_log_head - zc_log_tail > ZC_LOG_SIZE) {
+        return 0;
+    }
+    zc_log_tail += pending;
+    return (uint8_t)pending;
+}
+
+// Restart while the motor is not settled: drop the logged crossings, rate 0. The first plausible fit afterwards has
 // no earlier value to be compared with, hence the full hold count.
 void rpmRateReset(void)
 {
-    uint32_t records[RPM_RATE_READ_BATCH];
-    for (uint8_t batch = 0; batch < RPM_RATE_MAX_READS; batch++) {
-        if (zcCaptureRead(records, RPM_RATE_READ_BATCH) < RPM_RATE_READ_BATCH) {
-            break;
-        }
-    }
+    zc_log_tail = zc_log_head;
     restartWindow();
     erpm_rate = 0;
     erpm_rate_telem = 0;
@@ -345,7 +376,7 @@ void rpmRateUpdate(void)
 {
     uint32_t records[RPM_RATE_READ_BATCH];
     for (uint8_t batch = 0; batch < RPM_RATE_MAX_READS; batch++) {
-        uint8_t count = zcCaptureRead(records, RPM_RATE_READ_BATCH);
+        uint8_t count = readCrossings(records, RPM_RATE_READ_BATCH);
         for (uint8_t i = 0; i < count; i++) {
             addCrossing(records[i]);
         }

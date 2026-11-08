@@ -229,7 +229,6 @@ an settings option)
 #include "kiss_telemetry.h"
 #include "rpm_rate.h"
 #include "rpm_filter.h"
-#include "zc_capture.h"
 #include "signal.h"
 #include "sounds.h"
 #include "targets.h"
@@ -581,6 +580,9 @@ uint8_t min_bemf_counts_down = TARGET_MIN_BEMF_COUNTS;
 
 volatile uint16_t lastzctime;
 volatile uint16_t thiszctime;
+// Zero-crossing log for the eRPM rate fit
+volatile uint32_t zc_log[ZC_LOG_SIZE];
+volatile uint32_t zc_log_head;
 
 volatile uint16_t duty_cycle = 0;
 char step = 1;
@@ -937,6 +939,22 @@ void PeriodElapsedCallback()
     }
 }
 
+// Log the crossing detected for the eRPM rate fit. Called with interrupts disabled, so two
+// records never mix.
+static inline void logZeroCrossing(void)
+{
+    uint32_t record = ((uint32_t)get_timer_us16() << 16) | (step & ZC_LOG_STEP_MASK);
+    if (forward) {
+        record |= ZC_LOG_FORWARD;
+    }
+    if (zero_crosses < 100) {
+        record |= ZC_LOG_STARTUP;
+    }
+    uint32_t head = zc_log_head;
+    zc_log[head & (ZC_LOG_SIZE - 1)] = record;
+    zc_log_head = head + 1; // publish after the record is stored
+}
+
 /*
  * @brief 	Called by the comparator interrupt handler.
  * 			Disables the comparator interrupt.
@@ -971,7 +989,7 @@ void interruptRoutine()
     thiszctime = INTERVAL_TIMER_COUNT;  
     SET_INTERVAL_TIMER_COUNT(0);
     SET_AND_ENABLE_COM_INT(waitTime+1); // enable COM_TIMER interrupt
-    zcCaptureRecord(step, forward, zero_crosses, 0); // executed after both timers are set, so the commutation time is unaffected
+    logZeroCrossing(); // executed after both timers are set, so the commutation time is unaffected
     __enable_irq();
 }
 
@@ -1660,7 +1678,12 @@ void zcfoundroutine()
 { // only used in polling mode, blocking routine.
     thiszctime = INTERVAL_TIMER_COUNT;
     SET_INTERVAL_TIMER_COUNT(0);
-    zcCaptureRecord(step, forward, zero_crosses, 1); // executed before the wait below, which ends on INTERVAL_TIMER_COUNT
+    // Executed before the wait below, which ends on INTERVAL_TIMER_COUNT.
+    // Masked with disable/enable IRQ because the stall restart calls this routine
+    // from the main loop, where the 20 kHz interrupt can preempt it.
+    __disable_irq();
+    logZeroCrossing();
+    __enable_irq();
     commutation_interval = (thiszctime + (3 * commutation_interval)) / 4;
     advance = (temp_advance * commutation_interval) >> 6; //   7.5 degree increments
     waitTime = commutation_interval / 2 - advance;
