@@ -229,6 +229,7 @@ an settings option)
 #include "kiss_telemetry.h"
 #include "rpm_rate.h"
 #include "rpm_filter.h"
+#include "zc_capture.h"
 #include "signal.h"
 #include "sounds.h"
 #include "targets.h"
@@ -447,8 +448,7 @@ uint16_t commutation_intervals[6] = { 0 };
 volatile uint32_t average_interval = 0;
 uint32_t last_average_interval;
 int e_com_time;
-// e_com_time sampled in the 1 kHz block for the eRPM rate estimate (0 = motor not settled), consumed in the main loop
-volatile int rpm_rate_sample = 0;
+volatile uint8_t rpm_rate_settled = 0;
 volatile uint8_t rpm_rate_sample_ready = 0;
 
 uint16_t ADC_smoothed_input = 0;
@@ -971,6 +971,7 @@ void interruptRoutine()
     thiszctime = INTERVAL_TIMER_COUNT;  
     SET_INTERVAL_TIMER_COUNT(0);
     SET_AND_ENABLE_COM_INT(waitTime+1); // enable COM_TIMER interrupt
+    zcCaptureRecord(step, forward, zero_crosses, 0); // executed after both timers are set, so the commutation time is unaffected
     __enable_irq();
 }
 
@@ -1516,10 +1517,9 @@ void tenKhzRoutine()
                 speedPid.last_error = 0;
                 speedPid.integral = 0;
             }
-            // Sample the commutation period at this fixed rate for the eRPM rate estimate, once it is settled (same
-            // threshold as the speed loop). The estimate itself runs in the main loop to keep its divisions out of
-            // this interrupt, the G0 has no hardware divider.
-            rpm_rate_sample = (running && zero_crosses >= 100) ? e_com_time : 0;
+            // Check if the RPM rate is settled
+            // The fit runs in the main loop to keep its divisions out of this interrupt.
+            rpm_rate_settled = (running && zero_crosses >= 100);
             rpm_rate_sample_ready = 1;
         }
         if (ramp_count > ramp_divider) {
@@ -1660,6 +1660,7 @@ void zcfoundroutine()
 { // only used in polling mode, blocking routine.
     thiszctime = INTERVAL_TIMER_COUNT;
     SET_INTERVAL_TIMER_COUNT(0);
+    zcCaptureRecord(step, forward, zero_crosses, 1); // executed before the wait below, which ends on INTERVAL_TIMER_COUNT
     commutation_interval = (thiszctime + (3 * commutation_interval)) / 4;
     advance = (temp_advance * commutation_interval) >> 6; //   7.5 degree increments
     waitTime = commutation_interval / 2 - advance;
@@ -1966,16 +1967,17 @@ e_com_time = ((commutation_intervals[0] + commutation_intervals[1] + commutation
 measured_rpm = e_com_time ? (60000000 / (eepromBuffer.motor_poles / 2) + e_com_time / 2) / e_com_time : 0;
 
 // RPM rate estimate
-// Sample the RPM rate at a fixed interval, and update it in the main loop to avoid doing divisions during interrupts
+// Fit the zero crossings at the fixed rate of the 1 kHz block, in the main loop to avoid doing divisions during
+// interrupts
 if (rpm_rate_sample_ready) {
-    __disable_irq(); // take sample and flag together
-    int sample = rpm_rate_sample;
+    __disable_irq(); // take tick and flag together
+    uint8_t settled = rpm_rate_settled;
     rpm_rate_sample_ready = 0;
     __enable_irq();
-    if (sample > 0) {
-        rpmRateUpdate(sample);
+    if (settled) {
+        rpmRateUpdate();
     } else {
-        rpmRateReset(e_com_time);
+        rpmRateReset();
     }
 }
 
