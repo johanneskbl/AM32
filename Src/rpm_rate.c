@@ -10,7 +10,7 @@
  *     z = 60 * 10^6 / T  [eRPM]
  *   Samples arrive every dt = 1.05 ms from the 1 kHz block of tenKhzRoutine().
  *
- * Savitzky-Golay derivative: quadratic fit over the last N = 2m + 1 = 17 samples, differentiated at the centre
+ * Savitzky-Golay derivative: quadratic fit over the last N = 2m + 1 = 41 samples, differentiated at the centre
  *   1. Fit samples: The samples get the index j \in [-m,...,m] counted from the centre sample: j = 0 is m samples old,
  *      j = m is the newest. A quadratic is fitted to them by least squares:
  *        p(j) = c0 + c1*j + c2*j^2,   minimising  sum_j (z_j - p(j))^2
@@ -22,7 +22,7 @@
  *      do not enter it, which is why they are not computed. Per second:
  *        rate = c1 / dt  [eRPM/s]
  *   Together this is a fixed weighted sum of the samples, weights j / (dt * sum j^2): a linear-phase FIR filter.
- *   Its delay is exactly m samples (8 * 1.05 = 8.4 ms) at all frequencies, plus the averaging over one electrical
+ *   Its delay is exactly m samples (20 * 1.05 = 21.0 ms) at all frequencies, plus the averaging over one electrical
  *   revolution in e_com_time.
  *
  * Integer arithmetic only. Called from the main loop with the e_com_time samples taken at the fixed rate of the
@@ -38,10 +38,24 @@
 // Update frequency of 1 / dt in Hz, rounded (952 at 20 kHz, -0.04 %)
 #define RPM_RATE_UPDATE_HZ ((LOOP_FREQUENCY_HZ + RPM_RATE_TICKS_PER_UPDATE / 2) / RPM_RATE_TICKS_PER_UPDATE)
 
-// Window of N = 2m + 1 samples, j \in [-m,...,m]
-#define RPM_RATE_SG_HALF_WINDOW 8
+// Window of N = 2m + 1 samples, j \in [-m,...,m]. A longer window smooths more but delays the rate by m * dt:
+//
+//    N    lag      noise @ 7500 rpm    noise @ 11000 rpm   ramp deviation @ 7500 rpm
+//   17    8.4 ms   767 rpm/s           2111 rpm/s          735 rpm/s
+//   25   12.6 ms   398 rpm/s (-48 %)   1188 rpm/s          274 rpm/s
+//   33   16.8 ms   251 rpm/s (-67 %)    793 rpm/s          202 rpm/s
+//   41   21.0 ms   176 rpm/s (-77 %)    569 rpm/s          142 rpm/s   <- selected
+//   49   25.2 ms   132 rpm/s (-83 %)    430 rpm/s           97 rpm/s
+//
+// Lag: m * 1.05 ms, a pure delay at all frequencies, plus ~1.1 ms of period averaging in e_com_time at 7500 rpm.
+// Noise: RMS of the rate at constant speed. Ramp deviation: RMS difference from a 2480 rpm/s ramp commanded in 20 ms
+// steps, which the rotor follows in real 50 Hz pulses. Mechanical rpm (7 pole pairs), simulated with the zero-crossing
+// jitter calibrated on the 2026-11-07/08 motor_test bench bags (N = 17 measured ~800 rpm/s at 7000-8000 rpm and
+// ~2300 rpm/s at 11000-12000 rpm). Differentiating between the centre and the newest sample instead gives ~25 % less
+// noise at equal lag, but it is not linear phase and undershoots by 7-20 % after every ramp end.
+#define RPM_RATE_SG_HALF_WINDOW 20
 #define RPM_RATE_SG_WINDOW (2 * RPM_RATE_SG_HALF_WINDOW + 1)
-// Scaling factor: sum_j j^2 over j \in [-m,...,m] = m(m + 1)(2m + 1) / 3, 408 for m = 8
+// Scaling factor: sum_j j^2 over j \in [-m,...,m] = m(m + 1)(2m + 1) / 3, 5740 for m = 20
 #define RPM_RATE_SG_SUM_J2 \
     (RPM_RATE_SG_HALF_WINDOW * (RPM_RATE_SG_HALF_WINDOW + 1) * (2 * RPM_RATE_SG_HALF_WINDOW + 1) / 3)
 
@@ -51,6 +65,10 @@
 // of the former filter.
 #ifndef RPM_RATE_OUTLIER_Q4
 #define RPM_RATE_OUTLIER_Q4 131072L // 8192 eRPM
+#endif
+// The gate bounds |z_j - z_0| <= m * RPM_RATE_OUTLIER_Q4, so |sum_j j * (z_j - z_0)| <= m(m + 1) * m * RPM_RATE_OUTLIER_Q4
+#if RPM_RATE_SG_HALF_WINDOW * (RPM_RATE_SG_HALF_WINDOW + 1) * RPM_RATE_SG_HALF_WINDOW * RPM_RATE_OUTLIER_Q4 > 2147483647
+#error "rpm_rate.c: window and outlier gate allow the fit sum to overflow int32"
 #endif
 #define RPM_RATE_MAX_OUTLIERS 8     // consecutive outliers tolerated before the restart
 // Rate limit, also keeps c1 * RPM_RATE_UPDATE_HZ in int32
@@ -112,7 +130,7 @@ void rpmRateUpdate(int e_com_time_us)
 
     // Step 1: fit p(j) = c0 + c1*j + c2*j^2 to the window, of which only c1 = sum_j j*z_j / sum_j j^2 is needed.
     // Since sum_j j = 0, summing j * (z_j - z_0) gives the same result, and the gate bounds every term:
-    // |z_j - z_0| <= 8 * 131072, so |sum| <= 72 * 8 * 131072 < 2^27 and the * 16 below stays in int32.
+    // |z_j - z_0| <= 20 * 131072, so |sum| <= 420 * 20 * 131072 < 2^31 (checked at compile time above).
     uint8_t centre = oldest + RPM_RATE_SG_HALF_WINDOW;
     if (centre >= RPM_RATE_SG_WINDOW) {
         centre -= RPM_RATE_SG_WINDOW;
@@ -120,14 +138,17 @@ void rpmRateUpdate(int e_com_time_us)
     const int32_t z_centre_q4 = window_q4[centre];
     int32_t sum_jz_q4 = 0;
     uint8_t i = oldest; // j = -m
-    // Kept as a loop: -O3 would unroll it to ~850 bytes, which overflows the 27 KB flash of the E230 targets
+    // Kept as a loop: -O3 would unroll it (~850 bytes already at N = 17), which overflows the 27 KB flash of the E230
+    // targets
 #pragma GCC unroll 1
     for (int32_t j = -RPM_RATE_SG_HALF_WINDOW; j <= RPM_RATE_SG_HALF_WINDOW; j++) {
         sum_jz_q4 += j * (window_q4[i] - z_centre_q4);
         i = (i + 1 == RPM_RATE_SG_WINDOW) ? 0 : i + 1;
     }
-    // c1 in 1/256 eRPM per sample (the sum is in 1/16 eRPM, times 16)
-    int32_t c1_q8 = sum_jz_q4 * 16 / RPM_RATE_SG_SUM_J2;
+    // c1 in 1/256 eRPM per sample (the sum is in 1/16 eRPM, times 16). sum * 16 would overflow int32, so the division
+    // is split: with sum = q * S + r (q and r carry the sign of sum, |r| < S), sum * 16 / S = 16 * q + 16 * r / S
+    // exactly, also under C's truncation toward zero.
+    int32_t c1_q8 = (sum_jz_q4 / RPM_RATE_SG_SUM_J2) * 16 + (sum_jz_q4 % RPM_RATE_SG_SUM_J2) * 16 / RPM_RATE_SG_SUM_J2;
 
     // Step 2: differentiate p at the centre, p'(0) = c1 per sample, and convert to per second: rate = c1 / dt
     if (c1_q8 > RPM_RATE_MAX_C1_Q8) {
@@ -151,7 +172,7 @@ void rpmRateUpdate(int e_com_time_us)
 }
 
 // Latest estimate in units of 100 eRPM/s, held between updates and 0 while the motor is not settled.
-// It describes the rotor half a window (8.4 ms) before the newest sample.
+// It describes the rotor half a window (21.0 ms) before the newest sample.
 // makeTelemPackage() sends it as a big-endian two's-complement int16.
 int16_t getEstimatedRPMRateForTelemetry(void)
 {
