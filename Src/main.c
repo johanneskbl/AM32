@@ -229,6 +229,7 @@ an settings option)
 #include "kiss_telemetry.h"
 #include "rpm_rate.h"
 #include "rpm_filter.h"
+#include "zc_speed.h"
 #include "signal.h"
 #include "sounds.h"
 #include "targets.h"
@@ -292,9 +293,9 @@ uint32_t MAXIMUM_RPM_SPEED_CONTROL = 13300;
 // The output is accumulated into input_override every 1 kHz tick, so Kp acts as the integral term and Kd as the
 // proportional term of the throttle command.
 fastPID speedPid = { // 1khz loop time
-    .Kp = 80,  // 10
+    .Kp = 65, // 80,  // 10
     .Ki = 0,
-    .Kd = 4000,  // 100
+    .Kd = 3000, // 4000,  // 100
     .integral_limit = 10000,
     .output_limit = 2047 * 10000 // no per-tick clamp, clipping the proportional kick slows the response a lot
 };
@@ -580,7 +581,7 @@ uint8_t min_bemf_counts_down = TARGET_MIN_BEMF_COUNTS;
 
 volatile uint16_t lastzctime;
 volatile uint16_t thiszctime;
-// Zero-crossing log for the eRPM rate fit
+// Zero-crossing log for the speed estimate and the eRPM rate fit
 volatile uint32_t zc_log[ZC_LOG_SIZE];
 volatile uint32_t zc_log_head;
 
@@ -1492,12 +1493,17 @@ void tenKhzRoutine()
                     stall_protection_adjust = 0;
                 }
             }
-            // Low-pass filtered RPM for the speed PID and the telemetry frame
+            // Low-pass filtered RPM for the speed PID and the telemetry frame: the alpha-beta filter (rpm_filter.c) on
+            // the zero-crossing speed (zc_speed.c), or on measured_rpm while that has no estimate (start of a run,
+            // targets without the microsecond timer).
             // During the blind startup it is held on the measurement, so the PID does not see a jump from a stale
             // value when it takes over.
             if (running) {
                 // Current clamped RPM measurement
-                int32_t newest_rpm = (measured_rpm > SPEED_PID_FILTER_MAX_RPM) ? SPEED_PID_FILTER_MAX_RPM : (int32_t)measured_rpm;
+                int32_t newest_rpm = getZcSpeedRPM(eepromBuffer.motor_poles / 2, (int32_t)measured_rpm);
+                if (newest_rpm > SPEED_PID_FILTER_MAX_RPM) {
+                    newest_rpm = SPEED_PID_FILTER_MAX_RPM;
+                }
                 if (zero_crosses < (uint32_t)(30 >> eepromBuffer.stall_protection)) {
                     rpmFilterReset(newest_rpm);
                 } else {
@@ -1989,19 +1995,16 @@ e_com_time = ((commutation_intervals[0] + commutation_intervals[1] + commutation
 // Rounded: truncating read 0.5 rpm (3.5 eRPM) low on average, a third of the eRPM / 10 telemetry step
 measured_rpm = e_com_time ? (60000000 / (eepromBuffer.motor_poles / 2) + e_com_time / 2) / e_com_time : 0;
 
-// RPM rate estimate
-// Fit the zero crossings at the fixed rate of the 1 kHz block, in the main loop to avoid doing divisions during
-// interrupts
+// Zero crossings
+// RPM speed estimate for the RPM filter (speed PID and telemetry RPM) and the eRPM rate fit. In the main loop to avoid
+// doing divisions during interrupts.
+zcSpeedProcess(eepromBuffer.motor_poles / 2, running);
 if (rpm_rate_sample_ready) {
     __disable_irq(); // take tick and flag together
     uint8_t settled = rpm_rate_settled;
     rpm_rate_sample_ready = 0;
     __enable_irq();
-    if (settled) {
-        rpmRateUpdate();
-    } else {
-        rpmRateReset();
-    }
+    rpmRateTick(settled);
 }
 
 #if defined(FIXED_DUTY_MODE) || defined(FIXED_SPEED_MODE)

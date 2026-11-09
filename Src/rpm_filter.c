@@ -3,11 +3,12 @@
  * Created on: 2026-11-06
  *
  * Low-pass filtered mechanical RPM for the speed PID and the telemetry frame:
- * Implementation of the position state x of an alpha-beta tracking filter on measured_rpm,
+ * Implementation of the position state x of an alpha-beta tracking filter on the zero-crossing speed (zc_speed.c,
+ * the mean speed of the last <= 2.5 ms of crossings), or on measured_rpm while that has no estimate,
  * updated once per 1 kHz speed loop tick (dt = 1.05 ms at 20 kHz).
  *
  * Model and filter
- *   Constant-rate model with the measurement z = measured_rpm, the position state x = RPM
+ *   Constant-rate model with the measurement z = zero-crossing speed, the position state x = RPM
  *   and the velocity state v = RPM change per tick:
  *     predict:     x̂⁻_k = x̂_{k−1} + Δt·v̂_{k−1}
  *     innovation:  r_k  = z_k − x̂⁻_k
@@ -20,27 +21,33 @@
  * Gain design
  *   Steady-state Kalman gains (Kalata relation) for white acceleration and white measurement noise:
  *     alpha = 1 - p^2,  beta = 2*(1 - p)^2,  p = exp(-2*pi*f*dt)
- *   The frequency f is the tuning parameter, here f = 25 Hz. The poles are complex with a damping of ~0.71.
+ *   The frequency f is the tuning parameter, here f = 15 Hz. The poles are complex with a damping of ~0.71.
  *   The transfer function from z to x follows:
  *     X(z)/Z(z) = (alpha + (beta - alpha)*z^-1) / (1 - (2 - alpha - beta)*z^-1 + (1 - alpha)*z^-2)
- *   Compared with the critically damped double pole (beta = (1 - p)^2, f = 30 Hz) at the same 2.25 ms lag on
- *   rotor steps (simulation calibrated on the 29 Oct 2026 ESC3 bench data, 9 us zero-crossing jitter):
- *   noise 11.0 instead of 12.6 RPM at 8000 RPM (-13 %) and 36.0 instead of 37.1 RPM at 11000 RPM (-3 %), same step
- *   tracking and speed loop behaviour, frequency-response peak +1.7 dB instead of +1.0 dB.
+ *   Choice of f and of the zero-crossing averaging (closed speed-loop model fitted to the 2026-11-09 ESC3 bench bags,
+ *   telemetry RPM noise at normal / PWM-beat targets and RMS error against the true speed in a 5 Hz chirp):
+ *     2.5 ms average + 15 Hz:  4.0 / 7.8 RPM, 18.6 RPM   <- selected
+ *     2.5 ms average + 20 Hz:  4.8 / 10.1 RPM, 16.5 RPM
+ *     5 ms average + 15 Hz:    2.5 / 5.6 RPM, 25.7 RPM
+ *     10 ms average alone:     5.4 / 11.9 RPM, 30.7 RPM  (a moving average lags a ramp by half its span)
+ *     e_com_time + 25 Hz:      20.4 / 18.4 RPM, 17.1 RPM (the former input)
+ *   The short average keeps its delay at ~1.5 ms, and the filter smooths without lagging a ramp. The PWM-beat
+ *   targets are where a commutation step spans a whole number of PWM periods (8571 RPM: 4, 11429 RPM: 3, ...): the
+ *   detection error then varies at a few hundred Hz, which the filter removes before the telemetry samples it.
  * 
  * Integer arithmetic only (no division), so it runs in the 1 kHz block of tenKhzRoutine() next to the speed PID.
  */
 
 #include "rpm_filter.h"
 
-// Gains in fixed point, alpha in Q11 (x 2048) and beta in Q16 (x 65536), for f = 25 Hz at dt = 1.05 ms
-// Other choices of f (alpha / beta): 15 Hz: 368 / 1164, 20 Hz: 475 / 2003. Lower f: less noise, more lag.
+// Gains in fixed point, alpha in Q11 (x 2048) and beta in Q16 (x 65536), for f = 15 Hz at dt = 1.05 ms
+// Other choices of f (alpha / beta): 20 Hz: 475 / 2003, 25 Hz: 575 / 3030. Lower f: less noise, more lag.
 // Above ~29 Hz beta reaches 4096, which the residual clamp below no longer keeps in int32.
 #ifndef RPM_FILTER_ALPHA_Q11
-#define RPM_FILTER_ALPHA_Q11 575 // alpha = 575 / 2048 = 0.2808
+#define RPM_FILTER_ALPHA_Q11 368 // alpha = 368 / 2048 = 0.1797
 #endif
 #ifndef RPM_FILTER_BETA_Q16
-#define RPM_FILTER_BETA_Q16 3030 // beta = 3030 / 65536 = 0.04623
+#define RPM_FILTER_BETA_Q16 1164 // beta = 1164 / 65536 = 0.01776
 #endif
 #if RPM_FILTER_BETA_Q16 >= 4096
 #error "RPM_FILTER_BETA_Q16 must stay below 4096, else residual * beta overflows int32"
