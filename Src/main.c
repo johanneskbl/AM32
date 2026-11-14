@@ -297,8 +297,82 @@ fastPID speedPid = { // 1khz loop time
     .Ki = 0,
     .Kd = 3000, // 4000,  // 100
     .integral_limit = 10000,
-    .output_limit = 2047 * 10000 // no per-tick clamp, clipping the proportional kick slows the response a lot
+    .output_limit = 2047 * 10000 // clamps jumps in the PID output per-tick BUT if it does it slows the response a lot
 };
+
+// ---- Speed PID loop hardening (RPM mode) ----
+// 1) Slew limit of the RPM setpoint in RPM/s, up and down
+//    The slew limit parameter bounds how fast the RPM setpoint can change. When the PID receives the DShot
+//    command target_rpm_cmd it is checked and limited to the slew limit resuting in target_rpm. Also, when the PID takes
+//    over after a blind startup (or a restart), the ramp starts at the measured speed instead of jumping to the
+//    command to avoid large jumps especially at startup.
+//
+//      0 = no limit
+//
+//    Why limit the setpoint?
+//    - A duty rate limit that keeps the accumulator (the AM32 ramp max_duty_cycle_change) keeps small steps fast but
+//      hardly bounds the takeoff current: the loop still demands full duty and only gets there a few ms later.
+//    - The current a motor draws to accelerate is set by the acceleration (torque = inertia * acceleration). The slew
+//      bounds the acceleration the loop asks for, so it bounds the current. It acts outside the feedback loop: gains,
+//      stability and disturbance rejection stay as they are, and simply slows changes in commands if they exceed the limit.
+//    Why not limit the PID output (speedPid.output_limit)?
+//    - output_limit clips the per-tick increment before it is accumulated, so the clipped part is simply lost and only
+//      the integral term (Kp) can track it slowly. That bounds the takeoff current, but every command
+//      step whose kick exceeds the limit (steps > limit / 0.3 RPM) also becomes slow. Anti-windup cannot help, the
+//      kick is discarded before it is accumulated.
+//
+//    Up: bounds the acceleration
+//      Idle to hover at a limit of 20000 RPM/s: 1670 -> 7900 RPM takes 0.31 s.
+//    Down: bounds the braking
+//      Drag alone decelerates by roughly 20000 RPM/s at 9000 RPM, 15000 at 8000 RPM, 4000 at 4000 RPM.
+//    Cost: a command step is slower once it exceeds slew * tau
+#define SPEED_LOOP_TARGET_SLEW_UP_RPM_PER_S 0 // 30000
+#define SPEED_LOOP_TARGET_SLEW_DOWN_RPM_PER_S 0 // 30000
+
+// 2) Anti-windup: conditional integration
+//    When activated and the duty is held in the direction of the error (e.g. due to duty_cycle_maximum, current limit,
+//    ramp/duty drop limit), the integral part Kp * error is not accumulated into the PID input (input_override).
+//    When deactivated, the accumulator integrates toward full throttle while the duty is held at the limit, and releases
+//    it as an overshoot once the cap opens.
+//
+//      0 = off
+//      1 = on
+#define SPEED_LOOP_ANTI_WINDUP 0
+
+// 3) Desync check exemption during commanded acceleration
+//    The main loop checks for desyncs once per electrical revolution by comparing the length of the current electrical
+//    revolution to the previous one. Above ~1430 RPM (average_interval < 2000 us) it declares a desync if the speed
+//    rose by more than 50 % within one revolution, or halved. Then a desync is triggered, stopping and restarting the
+//    motor causing a blind startup. When RPM mode is used the PID accumulator is cleared, so the PID re-enters against
+//    the full error and kicks again. A 50 % rise within one revolution takes more than about
+//    0.5 * RPM^2 * pole_pairs / 60 RPM/s: ~130000 RPM/s at 1500 RPM, ~230000 RPM/s at 2000 RPM.
+//    With this flag, cheking if the speed has increased by more than 50 % is skipped while the speed loop deliberately
+//    accelerates, i.e. target_rpm is more than SPEED_LOOP_DESYNC_ACCEL_MARGIN_RPM above the measured speed.
+//    The flag does not change how the motor moves, only whether the protection should restart it.
+//    - Still detected: a drop to half speed, even while accelerating, and any speed-up
+//      without a commanded acceleration. A real desync that shows up as an apparent speed-up raises the filtered speed
+//      toward the setpoint within a few ms, which ends the exemption.
+//
+//      0 = off
+//      1 = on
+//      Margin of the RPM difference that still counts as a commanded acceleration
+#define SPEED_LOOP_DESYNC_IGNORE_COMMANDED_ACCEL 0
+#define SPEED_LOOP_DESYNC_ACCEL_MARGIN_RPM 300
+
+// 4) Duty drop limit [duty counts of 2000 per ms] while the speed loop runs (20 = 1 % duty per ms)
+//    Applied to decreases the PID asks for. A falling low-RPM/temperature cap or current limit still pulls the duty
+//    down at the stock rate, and a stop command (input <= 47) is never delayed. The stock ramp is 120 (low RPM) /
+//    320 (high RPM) counts per ms in both directions.
+//    Bounds the peak braking current: once the duty falls faster than aerodynamic drag alone slows the rotor
+//    (~2 counts/ms at hover), the rotor has to follow by braking, which takes a phase current of about
+//    (J*V*r/Ke - Q)/Ke for a drop rate r [1/s] (J rotor inertia, Ke back-EMF constant, Q drag torque).
+//    It does not bound the energy returned to the supply: sim, 9000 -> 6500 RPM step, the peak braking current falls
+//    from -98 A to -39 A at 10 counts/ms, but the returned charge rises from 1.0 C to 1.6 C, because gentler braking
+//    wastes less energy in the windings. For a supply that cannot absorb current, the down slew of (1) is the lever.
+//
+//      0 = off
+//      1-200 = duty counts per ms, 200 = 10 % duty per ms
+#define SPEED_LOOP_MAX_DUTY_DROP_PER_MS 0  // 10
 
 // Sanity check: Measured RPM above this is clamped before filtering
 #define SPEED_PID_FILTER_MAX_RPM 30000
@@ -369,8 +443,12 @@ uint16_t ADC_CCR = 30;
 uint16_t current_angle = 90;
 uint16_t desired_angle = 90;
 char return_to_center = 0;
-uint16_t target_rpm = 0;   // Speed loop setpoint in mechanical RPM
-uint32_t measured_rpm = 0; // Mechanical RPM measured from e_com_time, updated in the main loop to keep the division out of the 1 kHz interrupt
+uint16_t target_rpm_cmd = 0; // RPM commanded over DShot in mechanical RPM
+uint16_t target_rpm = 0;     // Speed loop setpoint in mechanical RPM, follows target_rpm_cmd safely
+int32_t speed_loop_target_q8 = 0;                  // target_rpm in 1/256 RPM, state of the slew limit
+volatile uint8_t is_speed_loop_accelerating = 0;   // Flag indicating if the speed loop commands acceleration, read by the desync check
+uint32_t speed_loop_drop_credit_q8 = 0;            // duty count in 1/256
+uint32_t measured_rpm = 0;   // RPM measured from e_com_time in mechanical RPM, updated in the main loop to keep the division out of the 1 kHz interrupt
 int16_t Speed_pid_output;
 char use_speed_control_loop = 0;
 int32_t input_override = 0;
@@ -621,6 +699,168 @@ int32_t doPidCalculations(struct fastPID* pidnow, int actual, int target)
     }
     return pidnow->pid_output;
 }
+
+//=========================================================================================
+//======================= Speed PID loop hardening utilities ==============================
+//=========================================================================================
+// Called from the 1 kHz block (speed loop tick, PID_LOOP_DIVIDER + 1 ticks of LOOP_FREQUENCY_HZ) and from the duty
+// ramp of tenKhzRoutine().
+
+#define SPEED_LOOP_TARGET_SLEW (SPEED_LOOP_TARGET_SLEW_UP_RPM_PER_S > 0 || SPEED_LOOP_TARGET_SLEW_DOWN_RPM_PER_S > 0)
+// Setpoint change per speed loop tick in 1/256 RPM, 0 = no limit
+#define SPEED_LOOP_SLEW_Q8(rpm_per_s)                                                                                \
+    ((int32_t)(((int64_t)(rpm_per_s) * 256 * (PID_LOOP_DIVIDER + 1) + LOOP_FREQUENCY_HZ / 2) / LOOP_FREQUENCY_HZ))
+#if (SPEED_LOOP_TARGET_SLEW_UP_RPM_PER_S > 0 && \
+     (SPEED_LOOP_TARGET_SLEW_UP_RPM_PER_S * 256 * (PID_LOOP_DIVIDER + 1)) / LOOP_FREQUENCY_HZ < 1) || \
+    (SPEED_LOOP_TARGET_SLEW_DOWN_RPM_PER_S > 0 && \
+     (SPEED_LOOP_TARGET_SLEW_DOWN_RPM_PER_S * 256 * (PID_LOOP_DIVIDER + 1)) / LOOP_FREQUENCY_HZ < 1)
+#error "SPEED_LOOP_TARGET_SLEW_*_RPM_PER_S is below the resolution of 1/256 RPM per speed loop tick"
+#endif
+
+#if SPEED_LOOP_MAX_DUTY_DROP_PER_MS > 0
+// Duty drop allowed per tick of LOOP_FREQUENCY_HZ in 1/256 duty counts
+#define SPEED_LOOP_DUTY_DROP_Q8 ((SPEED_LOOP_MAX_DUTY_DROP_PER_MS * 256 * 1000 + LOOP_FREQUENCY_HZ / 2) / LOOP_FREQUENCY_HZ)
+#if (SPEED_LOOP_MAX_DUTY_DROP_PER_MS * 256 * 1000) / LOOP_FREQUENCY_HZ < 1
+#error "SPEED_LOOP_MAX_DUTY_DROP_PER_MS is below the resolution of 1/256 duty count per tick"
+#endif
+#endif
+
+// Throttle input 48..2047 from the speed loop accumulator. Clamped in 32 bit: with the anti-windup the accumulator can
+// be negative or above the range, which a uint16_t cast would wrap (a negative value to full throttle).
+static inline uint16_t speedLoopInput(void)
+{
+    int32_t override_input = input_override / 10000;
+    if (override_input > 2047) {
+        override_input = 2047;
+    }
+    if (override_input < 48) {
+        override_input = 48;
+    }
+    return (uint16_t)override_input;
+}
+
+// Restarts the setpoint ramp at `rpm`, the measured speed when the PID takes over, 0 while the motor is stopped
+static inline void speedLoopTargetReset(int32_t rpm)
+{
+#if SPEED_LOOP_TARGET_SLEW
+    if (rpm < 0) {
+        rpm = 0;
+    }
+    if (rpm > 65535) {
+        rpm = 65535;
+    }
+    speed_loop_target_q8 = rpm << 8;
+    target_rpm = (uint16_t)rpm;
+#else
+    (void)rpm;
+    target_rpm = target_rpm_cmd;
+#endif
+}
+
+// Moves the setpoint toward the DShot command by at most one slew step
+static inline void speedLoopTargetUpdate(void)
+{
+#if SPEED_LOOP_TARGET_SLEW
+    int32_t delta_q8 = ((int32_t)target_rpm_cmd << 8) - speed_loop_target_q8;
+#if SPEED_LOOP_TARGET_SLEW_UP_RPM_PER_S > 0
+    if (delta_q8 > SPEED_LOOP_SLEW_Q8(SPEED_LOOP_TARGET_SLEW_UP_RPM_PER_S)) {
+        delta_q8 = SPEED_LOOP_SLEW_Q8(SPEED_LOOP_TARGET_SLEW_UP_RPM_PER_S);
+    }
+#endif
+#if SPEED_LOOP_TARGET_SLEW_DOWN_RPM_PER_S > 0
+    if (delta_q8 < -SPEED_LOOP_SLEW_Q8(SPEED_LOOP_TARGET_SLEW_DOWN_RPM_PER_S)) {
+        delta_q8 = -SPEED_LOOP_SLEW_Q8(SPEED_LOOP_TARGET_SLEW_DOWN_RPM_PER_S);
+    }
+#endif
+    speed_loop_target_q8 += delta_q8;
+    target_rpm = (uint16_t)((speed_loop_target_q8 + 128) >> 8);
+#else
+    target_rpm = target_rpm_cmd;
+#endif
+}
+
+#if SPEED_LOOP_MAX_DUTY_DROP_PER_MS > 0
+// True while the duty drop limit applies: the speed loop drives a running motor and the duty is not above a cap
+// that has to pull it down (low-RPM/temperature cap, current limit). Stop commands (input <= 47) are never delayed.
+static inline uint8_t speedLoopDropLimitActive(void)
+{
+    if (!use_speed_control_loop || !running || input <= 47) {
+        return 0;
+    }
+    if (last_duty_cycle > duty_cycle_maximum) {
+        return 0;
+    }
+    if (use_current_limit && (int32_t)last_duty_cycle > use_current_limit_adjust) {
+        return 0;
+    }
+    return 1;
+}
+
+// Limits the decrease of duty_cycle against last_duty_cycle in this ramp step. Token bucket in 1/256 counts: the
+// credit grows by the allowed drop per ramp step and is capped at one step plus one count, so a pause does not
+// save up for a sudden drop.
+static inline void speedLoopLimitDutyDrop(void)
+{
+    uint32_t step_q8 = (uint32_t)SPEED_LOOP_DUTY_DROP_Q8 * (ramp_divider + 1);
+    uint32_t credit_q8 = speed_loop_drop_credit_q8 + step_q8;
+    if (credit_q8 > step_q8 + 255) {
+        credit_q8 = step_q8 + 255;
+    }
+    int32_t max_drop = (int32_t)(credit_q8 >> 8);
+    if ((int32_t)last_duty_cycle - (int32_t)duty_cycle > max_drop) {
+        duty_cycle = last_duty_cycle - max_drop;
+    }
+    if (duty_cycle < last_duty_cycle) {
+        credit_q8 -= (uint32_t)(last_duty_cycle - duty_cycle) << 8;
+    }
+    speed_loop_drop_credit_q8 = credit_q8;
+}
+#endif
+
+#if SPEED_LOOP_ANTI_WINDUP
+// Bound against int32 overflow of input_override, far beyond any proportional kick (Kd * error)
+#define SPEED_LOOP_OVERRIDE_GUARD 1000000000L
+
+// True while the duty cannot follow input_override in the direction of `error` within two speed loop ticks: it is
+// held by the low-RPM/temperature cap or the current limit, or the ramp (up) or the duty drop limit (down) cannot
+// catch up. setInput() turns the accumulator into duty_cycle_setpoint only once per DShot frame (~1 kHz, not in
+// step with this tick), so a window of one tick would report a hold in normal operation.
+static inline uint8_t speedLoopOutputHeld(int32_t error)
+{
+    int32_t window_ticks = 2 * (PID_LOOP_DIVIDER + 1);
+    int32_t ramp_steps = ramp_divider ? window_ticks / (ramp_divider + 1) : window_ticks;
+    int32_t duty = last_duty_cycle;
+
+    int32_t duty_hi = duty_cycle_maximum;
+    if (use_current_limit && use_current_limit_adjust < duty_hi) {
+        duty_hi = use_current_limit_adjust;
+    }
+    if (duty + (int32_t)max_duty_cycle_change * ramp_steps < duty_hi) {
+        duty_hi = duty + (int32_t)max_duty_cycle_change * ramp_steps;
+    }
+
+    int32_t drop = (int32_t)max_duty_cycle_change * ramp_steps;
+#if SPEED_LOOP_MAX_DUTY_DROP_PER_MS > 0
+    int32_t limited_drop = ((SPEED_LOOP_DUTY_DROP_Q8 * window_ticks) >> 8) + 1;
+    if (limited_drop < drop) {
+        drop = limited_drop;
+    }
+#endif
+    int32_t duty_lo = duty - drop;
+    if (duty_lo > duty_hi) {
+        duty_lo = duty_hi; // a cap below the present duty: the duty falls to the cap, so does the accumulator
+    }
+
+    // Into accumulator units with the map() of setInput()
+    if (error > 0) {
+        return input_override >= map(duty_hi, minimum_duty_cycle, 2000, 47, 2047) * 10000;
+    }
+    if (error < 0) {
+        return input_override <= map(duty_lo, minimum_duty_cycle, 2000, 47, 2047) * 10000;
+    }
+    return 0;
+}
+#endif
 
 void loadEEpromSettings()
 {
@@ -1193,36 +1433,25 @@ void setInput()
                     // DShot 48 -> MINIMUM, 2047 -> MAXIMUM
                     // NOTE: This mapping must match the flight controller, i.e., spinal
                     // NOTE: Stock AM32 uses 47 -> MINIMUM, 2047 -> MAXIMUM, but 48 is DShot standard
+                    // The PID setpoint target_rpm follows this command in the speed loop tick (slew limit)
                     if (adjusted_input <= 48) {
-                        target_rpm = MINIMUM_RPM_SPEED_CONTROL;
+                        target_rpm_cmd = MINIMUM_RPM_SPEED_CONTROL;
                     } else if (adjusted_input >= 2047) {
-                        target_rpm = MAXIMUM_RPM_SPEED_CONTROL;
+                        target_rpm_cmd = MAXIMUM_RPM_SPEED_CONTROL;
                     } else {
                         // Rounded division instead of map() to avoid bisection problems and to increase resolution accuracy
-                        target_rpm = MINIMUM_RPM_SPEED_CONTROL + ((adjusted_input - 48) * (MAXIMUM_RPM_SPEED_CONTROL - MINIMUM_RPM_SPEED_CONTROL) + 999) / 1999;
+                        target_rpm_cmd = MINIMUM_RPM_SPEED_CONTROL + ((adjusted_input - 48) * (MAXIMUM_RPM_SPEED_CONTROL - MINIMUM_RPM_SPEED_CONTROL) + 999) / 1999;
                     }
                     if (adjusted_input < 47) { // dead band ?
                         input = 0;
                         speedPid.error = 0;
                         input_override = 0;
                     } else {
-                        input = (uint16_t)(input_override / 10000); // speed control pid override
-                        if (input > 2047) {
-                            input = 2047;
-                        }
-                        if (input < 48) {
-                            input = 48;
-                        }
+                        input = speedLoopInput(); // speed control pid override
                     }
                 } else {
 
-                    input = (uint16_t)(input_override / 10000); // speed control pid override
-                    if (input > 2047) {
-                        input = 2047;
-                    }
-                    if (input < 48) {
-                        input = 48;
-                    }
+                    input = speedLoopInput(); // speed control pid override
                 }
             } else {
 
@@ -1519,20 +1748,41 @@ void tenKhzRoutine()
                     speedPid.error = 0;
                     speedPid.last_error = 0;
                     speedPid.integral = 0;
+                    // The setpoint ramp starts at the measured speed (the filter was just reset to it) when the PID takes over
+                    speedLoopTargetReset(getFilteredRPM());
+                    is_speed_loop_accelerating = 0;
                 } else {
+                    speedLoopTargetUpdate();
                     // doPidCalculations() returns actual - target, which suits the commutation period of the stock loop
                     // (too slow = too long = positive). For RPM, pass target first to get target - measured, otherwise
                     // a too fast motor gets more throttle and runs away to full throttle.
-                    input_override += doPidCalculations(&speedPid, target_rpm, getFilteredRPM());
+                    int32_t filtered_rpm = getFilteredRPM();
+                    int32_t pid_step = doPidCalculations(&speedPid, target_rpm, filtered_rpm);
+#if SPEED_LOOP_ANTI_WINDUP
+                    // Anti-Windup: Conditional integration based on duty signal
+                    if (speedLoopOutputHeld(speedPid.error)) {
+                        pid_step -= speedPid.error * (int32_t)speedPid.Kp;
+                    }
+                    input_override += pid_step;
+                    if (input_override > 2047 * 10000 + SPEED_LOOP_OVERRIDE_GUARD) {
+                        input_override = 2047 * 10000 + SPEED_LOOP_OVERRIDE_GUARD;
+                    }
+                    if (input_override < -SPEED_LOOP_OVERRIDE_GUARD) {
+                        input_override = -SPEED_LOOP_OVERRIDE_GUARD;
+                    }
+#else
+                    input_override += pid_step;
                     if (input_override > 2047 * 10000) {
                         input_override = 2047 * 10000;
                     }
                     if (input_override < 0) {
                         input_override = 0;
                     }
+#endif
                     if (zero_crosses < 100) {
                         speedPid.integral = 0;
                     }
+                    is_speed_loop_accelerating = ((int32_t)target_rpm - filtered_rpm) > SPEED_LOOP_DESYNC_ACCEL_MARGIN_RPM;
                 }
             } else if (use_speed_control_loop) {
                 // Motor is not commutating (stopped, or just desynced) clear accumulator
@@ -1540,6 +1790,8 @@ void tenKhzRoutine()
                 speedPid.error = 0;
                 speedPid.last_error = 0;
                 speedPid.integral = 0;
+                speedLoopTargetReset(0);
+                is_speed_loop_accelerating = 0;
             }
             // Check if the RPM rate is settled
             // The fit runs in the main loop to keep its divisions out of this interrupt.
@@ -1577,6 +1829,11 @@ void tenKhzRoutine()
             if ((last_duty_cycle - duty_cycle) > max_duty_cycle_change) {
                 duty_cycle = last_duty_cycle - max_duty_cycle_change;
             }
+#if SPEED_LOOP_MAX_DUTY_DROP_PER_MS > 0
+            if (speedLoopDropLimitActive()) {
+                speedLoopLimitDutyDrop();
+            }
+#endif
             }else{
              duty_cycle = last_duty_cycle;
             }
@@ -1924,7 +2181,7 @@ int main(void)
 #ifdef FIXED_SPEED_MODE
     use_speed_control_loop = 1;
     eepromBuffer.use_sine_start = 0;
-    target_rpm = FIXED_SPEED_MODE_RPM;
+    target_rpm_cmd = FIXED_SPEED_MODE_RPM;
     input = 48;
 #endif
 
@@ -2132,7 +2389,12 @@ if(zero_crosses < 5){
 #endif
         average_interval = e_com_time / 3;
         if (desync_check && zero_crosses > 10) {
-            if ((getAbsDif(last_average_interval, average_interval) > average_interval >> 1) && (average_interval < 2000)) { // throttle resitricted before zc 20.
+            if ((getAbsDif(last_average_interval, average_interval) > average_interval >> 1) && (average_interval < 2000) // throttle resitricted before zc 20.
+#if SPEED_LOOP_DESYNC_IGNORE_COMMANDED_ACCEL
+                // A shorter interval while the speed loop commands acceleration is the commanded speed-up, not a desync
+                && !(is_speed_loop_accelerating && (average_interval < last_average_interval))
+#endif
+            ) {
                 zero_crosses = 0;
                 desync_happened++;
                 if ((!eepromBuffer.bi_direction && (input > 47)) || commutation_interval > 1000) {
